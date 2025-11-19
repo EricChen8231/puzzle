@@ -435,14 +435,7 @@ bool solve_one_fast(const vector<string> &grid,
     }
 
     // Embedding structures
-    vector<bool> assigned(numCells, false);
-    vector<Vec3> pos3d(numCells);
-    vector<Frame> frame3d(numCells);
-    unordered_map<Vec3,int,Vec3Hash> occ;
-    occ.reserve(numCells * 4);
-
-    // Normal counts (per outward normal)
-    vector<int> normalCount(6, 0);
+    RectangularPrism prism(numCells, maxFaceArea);
 
     // Choose a root with the highest degree to reduce branching
     int root = 0;
@@ -460,10 +453,12 @@ bool solve_one_fast(const vector<string> &grid,
         if (nid >= 0) normalCount[nid]++;
     }
 
+    prism.place_root(root, {0,0,0}, { {1,0,0}, {0,1,0}, {0,0,1} });
+
     auto compute_candidate_from_neighbor =
         [&](int a, int b, Dir d, int mode, Vec3 &candPos, Frame &candFrame) {
-            const Frame &fa = frame3d[a];
-            const Vec3 &pa = pos3d[a];
+            const Frame &fa = prism.frame[a];
+            const Vec3 &pa = prism.pos[a];
             Vec3 step = step_from_frame(fa, d);
 
             // The hinge axis is the edge shared by the two cells. For moves
@@ -499,7 +494,7 @@ bool solve_one_fast(const vector<string> &grid,
         [&](int b, const Vec3 &candPos, const Frame &candFrame) -> bool {
         for (auto &e : revAdj[b]) {
             int nb = e.to;
-            if (!assigned[nb]) continue;
+            if (!prism.assigned[nb]) continue;
 
             Dir dnb = e.dir;
 
@@ -529,19 +524,18 @@ bool solve_one_fast(const vector<string> &grid,
                 cerr << "Sol #" << (solIndex + 1)
                      << " DFS iters (fast): " << dfsIters << "\n";
 
-                print_partial_grid(cells, pos3d, frame3d, assigned, R, C);
+                print_partial_grid(cells, prism.pos, prism.frame, prism.assigned, R, C);
             } else {
                 cerr << "Sol #" << (solIndex + 1)
                      << " DFS iters (fast): " << dfsIters << "\n";
-                print_partial_grid(cells, pos3d, frame3d, assigned, R, C);
+                print_partial_grid(cells, prism.pos, prism.frame, prism.assigned, R, C);
             }
         }
 
-        if (assignedCount == numCells) {
+        if (prism.assignedCount == numCells) {
             BoxDims dims;
-            if (!compute_box_dims_and_check(pos3d, numCells, dims))
-                return false;
-            if (!check_markers(markers, cells, pos3d, frame3d, dims))
+            if (!prism.finalize(dims)) return false;
+            if (!check_markers(markers, cells, prism.pos, prism.frame, dims))
                 return false;
             return true; // success: box + markers satisfied
         }
@@ -551,9 +545,9 @@ bool solve_one_fast(const vector<string> &grid,
         bool foundFrontier = false;
 
         for (int i = 0; i < numCells && !foundFrontier; ++i) {
-            if (!assigned[i]) continue;
+            if (!prism.assigned[i]) continue;
             for (auto &e : adj[i]) {
-                if (!assigned[e.to]) {
+                if (!prism.assigned[e.to]) {
                     a = i;
                     b = e.to;
                     dirFromAtoB = e.dir;
@@ -571,9 +565,12 @@ bool solve_one_fast(const vector<string> &grid,
             Frame candFrame;
             compute_candidate_from_neighbor(a, b, dirFromAtoB, mode, candPos, candFrame);
 
-            if (occ.find(candPos) != occ.end()) continue;
+            if (prism.occ.find(candPos) != prism.occ.end()) continue;
             if (!candidate_compatible(b, candPos, candFrame)) continue;
 
+            if (prism.place(b, candPos, candFrame)) {
+                if (dfs()) return true;
+                prism.unplace(b);
             assigned[b] = true;
             pos3d[b] = candPos;
             frame3d[b] = candFrame;
@@ -598,13 +595,6 @@ bool solve_one_fast(const vector<string> &grid,
                 assigned[b] = false;
                 continue;
             }
-
-            if (dfs()) return true;
-
-            if (nid >= 0) normalCount[nid]--;
-            --assignedCount;
-            occ.erase(candPos);
-            assigned[b] = false;
         }
         return false;
     };
@@ -669,13 +659,7 @@ bool solve_one_capture(const vector<string> &grid,
         }
     }
 
-    vector<bool> assigned(numCells, false);
-    vector<Vec3> pos3d(numCells);
-    vector<Frame> frame3d(numCells);
-    unordered_map<Vec3,int,Vec3Hash> occ;
-    occ.reserve(numCells * 4);
-
-    vector<int> normalCount(6, 0);
+    RectangularPrism prism(numCells, maxFaceArea);
 
     int root = 0;
     for (int i = 1; i < numCells; ++i) {
@@ -692,10 +676,12 @@ bool solve_one_capture(const vector<string> &grid,
         if (nid >= 0) normalCount[nid]++;
     }
 
+    prism.place_root(root, {0,0,0}, { {1,0,0}, {0,1,0}, {0,0,1} });
+
     auto compute_candidate_from_neighbor =
         [&](int a, int b, Dir d, int mode, Vec3 &candPos, Frame &candFrame) {
-            const Frame &fa = frame3d[a];
-            const Vec3 &pa = pos3d[a];
+            const Frame &fa = prism.frame[a];
+            const Vec3 &pa = prism.pos[a];
             Vec3 step = step_from_frame(fa, d);
 
             Vec3 axis = (d == UP || d == DOWN) ? fa.u : fa.v;
@@ -724,7 +710,7 @@ bool solve_one_capture(const vector<string> &grid,
         [&](int b, const Vec3 &candPos, const Frame &candFrame) -> bool {
         for (auto &e : revAdj[b]) {
             int nb = e.to;
-            if (!assigned[nb]) continue;
+            if (!prism.assigned[nb]) continue;
 
             Dir dnb = e.dir;
 
@@ -753,15 +739,14 @@ bool solve_one_capture(const vector<string> &grid,
             cerr.flush();
         }
 
-        if (assignedCount == numCells) {
+        if (prism.assignedCount == numCells) {
             BoxDims dims;
-            if (!compute_box_dims_and_check(pos3d, numCells, dims))
-                return false;
-            if (!check_markers(markers, cells, pos3d, frame3d, dims))
+            if (!prism.finalize(dims)) return false;
+            if (!check_markers(markers, cells, prism.pos, prism.frame, dims))
                 return false;
 
             outCells = cells;
-            outPos = pos3d;
+            outPos = prism.pos;
             outDims = dims;
             outIters = dfsIters;
             return true;
@@ -772,14 +757,14 @@ bool solve_one_capture(const vector<string> &grid,
         int bestNeighborCount = -1;
 
         for (int i = 0; i < numCells; ++i) {
-            if (!assigned[i]) continue;
+            if (!prism.assigned[i]) continue;
             for (auto &e : adj[i]) {
                 int j = e.to;
-                if (assigned[j]) continue;
+                if (prism.assigned[j]) continue;
 
                 int cnt = 0;
                 for (auto &e2 : adj[j]) {
-                    if (assigned[e2.to]) ++cnt;
+                    if (prism.assigned[e2.to]) ++cnt;
                 }
                 if (cnt > bestNeighborCount) {
                     bestNeighborCount = cnt;
@@ -803,9 +788,12 @@ bool solve_one_capture(const vector<string> &grid,
             Frame candFrame;
             compute_candidate_from_neighbor(a, b, dirFromAtoB, mode, candPos, candFrame);
 
-            if (occ.find(candPos) != occ.end()) continue;
+            if (prism.occ.find(candPos) != prism.occ.end()) continue;
             if (!candidate_compatible(b, candPos, candFrame)) continue;
 
+            if (prism.place(b, candPos, candFrame)) {
+                if (dfs()) return true;
+                prism.unplace(b);
             assigned[b] = true;
             pos3d[b] = candPos;
             frame3d[b] = candFrame;
@@ -830,13 +818,6 @@ bool solve_one_capture(const vector<string> &grid,
                 assigned[b] = false;
                 continue;
             }
-
-            if (dfs()) return true;
-
-            if (nid >= 0) normalCount[nid]--;
-            --assignedCount;
-            occ.erase(candPos);
-            assigned[b] = false;
         }
         return false;
     };
