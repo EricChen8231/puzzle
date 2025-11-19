@@ -94,6 +94,34 @@ struct BoxDims {
     int minZ, maxZ;
 };
 
+// Given a surface area (number of cells) of a rectangular prism, return the
+// maximum possible area of any single face. This is used to prune embeddings:
+// if any outward normal already has more cells than the largest face could
+// hold, the partial embedding cannot ever close into a box.
+int max_face_area_from_surface(int surfaceCells) {
+    // surfaceCells = 2 * (a*b + a*c + b*c)
+    if (surfaceCells <= 0 || surfaceCells % 2 != 0) return surfaceCells;
+    int half = surfaceCells / 2;
+    int best = 0;
+
+    for (int a = 1; a * a <= half; ++a) {
+        for (int b = 1; a * b <= half; ++b) {
+            int rhs = half - a * b; // a*c + b*c
+            int denom = a + b;
+            if (rhs <= 0 || rhs % denom != 0) continue;
+            int c = rhs / denom;
+            if (c <= 0) continue;
+            int face1 = a * b;
+            int face2 = a * c;
+            int face3 = b * c;
+            best = max({best, face1, face2, face3});
+        }
+    }
+
+    if (best == 0) return surfaceCells; // fallback (should not happen for valid nets)
+    return best;
+}
+
 // ----------------- Box and marker checks -----------------
 
 bool compute_box_dims_and_check(const vector<Vec3> &pos3d, int numCells, BoxDims &dims) {
@@ -378,6 +406,7 @@ bool solve_one_fast(const vector<string> &grid,
     }
     int numCells = (int)cells.size();
     if (numCells == 0) return false;
+    int maxFaceArea = max_face_area_from_surface(numCells);
 
     // Build adjacency
     vector<vector<Edge>> adj(numCells);
@@ -415,14 +444,19 @@ bool solve_one_fast(const vector<string> &grid,
     // Normal counts (per outward normal)
     vector<int> normalCount(6, 0);
 
-    // Root cell
-    assigned[0] = true;
-    pos3d[0] = {0,0,0};
-    frame3d[0] = { {1,0,0}, {0,1,0}, {0,0,1} };
-    occ[pos3d[0]] = 0;
+    // Choose a root with the highest degree to reduce branching
+    int root = 0;
+    for (int i = 1; i < numCells; ++i) {
+        if ((int)adj[i].size() > (int)adj[root].size()) root = i;
+    }
+
+    assigned[root] = true;
+    pos3d[root] = {0,0,0};
+    frame3d[root] = { {1,0,0}, {0,1,0}, {0,0,1} };
+    occ[pos3d[root]] = root;
     int assignedCount = 1;
     {
-        int nid = normal_id(frame3d[0].n);
+        int nid = normal_id(frame3d[root].n);
         if (nid >= 0) normalCount[nid]++;
     }
 
@@ -431,19 +465,28 @@ bool solve_one_fast(const vector<string> &grid,
             const Frame &fa = frame3d[a];
             const Vec3 &pa = pos3d[a];
             Vec3 step = step_from_frame(fa, d);
-            candPos = pa + step;
+
+            // The hinge axis is the edge shared by the two cells. For moves
+            // along the grid's UP/DOWN, the edge runs along "u"; for LEFT/RIGHT
+            // it runs along "v". We must rotate both the frame and the offset
+            // vector around this axis to properly fold the neighbor out of the
+            // base plane.
+            Vec3 axis = (d == UP || d == DOWN) ? fa.u : fa.v;
+
             if (mode == 0) {
-                // same face
+                // same face (no fold)
+                candPos = pa + step;
                 candFrame = fa;
             } else {
-                Vec3 axis = step;
+                Vec3 rotStep = (mode == 1) ? rotate90_plus(step, axis)
+                                           : rotate90_minus(step, axis);
+                candPos = pa + rotStep;
+
                 if (mode == 1) {
-                    // +90
                     candFrame.u = rotate90_plus(fa.u, axis);
                     candFrame.v = rotate90_plus(fa.v, axis);
                     candFrame.n = rotate90_plus(fa.n, axis);
                 } else {
-                    // -90
                     candFrame.u = rotate90_minus(fa.u, axis);
                     candFrame.v = rotate90_minus(fa.v, axis);
                     candFrame.n = rotate90_minus(fa.n, axis);
@@ -542,7 +585,7 @@ bool solve_one_fast(const vector<string> &grid,
 
             bool tooBigFace = false;
             for (int k = 0; k < 6; ++k) {
-                if (normalCount[k] > 44) {
+                if (normalCount[k] > maxFaceArea) {
                     tooBigFace = true;
                     break;
                 }
@@ -599,6 +642,7 @@ bool solve_one_capture(const vector<string> &grid,
     }
     int numCells = (int)cells.size();
     if (numCells == 0) return false;
+    int maxFaceArea = max_face_area_from_surface(numCells);
 
     vector<vector<Edge>> adj(numCells);
     auto add_edge = [&](int r1, int c1, int r2, int c2, Dir d) {
@@ -633,13 +677,18 @@ bool solve_one_capture(const vector<string> &grid,
 
     vector<int> normalCount(6, 0);
 
-    assigned[0] = true;
-    pos3d[0] = {0,0,0};
-    frame3d[0] = { {1,0,0}, {0,1,0}, {0,0,1} };
-    occ[pos3d[0]] = 0;
+    int root = 0;
+    for (int i = 1; i < numCells; ++i) {
+        if ((int)adj[i].size() > (int)adj[root].size()) root = i;
+    }
+
+    assigned[root] = true;
+    pos3d[root] = {0,0,0};
+    frame3d[root] = { {1,0,0}, {0,1,0}, {0,0,1} };
+    occ[pos3d[root]] = root;
     int assignedCount = 1;
     {
-        int nid = normal_id(frame3d[0].n);
+        int nid = normal_id(frame3d[root].n);
         if (nid >= 0) normalCount[nid]++;
     }
 
@@ -648,11 +697,17 @@ bool solve_one_capture(const vector<string> &grid,
             const Frame &fa = frame3d[a];
             const Vec3 &pa = pos3d[a];
             Vec3 step = step_from_frame(fa, d);
-            candPos = pa + step;
+
+            Vec3 axis = (d == UP || d == DOWN) ? fa.u : fa.v;
+
             if (mode == 0) {
+                candPos = pa + step;
                 candFrame = fa;
             } else {
-                Vec3 axis = step;
+                Vec3 rotStep = (mode == 1) ? rotate90_plus(step, axis)
+                                           : rotate90_minus(step, axis);
+                candPos = pa + rotStep;
+
                 if (mode == 1) {
                     candFrame.u = rotate90_plus(fa.u, axis);
                     candFrame.v = rotate90_plus(fa.v, axis);
@@ -743,8 +798,6 @@ bool solve_one_capture(const vector<string> &grid,
         int b = bestB;
         Dir dirFromAtoB = bestDir;
 
-        int halfTotal = numCells / 2;
-
         for (int mode = 0; mode < 3; ++mode) {
             Vec3 candPos;
             Frame candFrame;
@@ -764,7 +817,7 @@ bool solve_one_capture(const vector<string> &grid,
 
             bool tooBigFace = false;
             for (int k = 0; k < 6; ++k) {
-                if (normalCount[k] > halfTotal) {
+                if (normalCount[k] > maxFaceArea) {
                     tooBigFace = true;
                     break;
                 }
@@ -833,9 +886,54 @@ int face_id(const Vec3 &p, const BoxDims &d) {
 
 // ----------------- Main (parallel search + sequential capture) -----------------
 
-int main() {
+int main(int argc, char **argv) {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
+
+    // Optional: run the 8x8 example provided in the prompt.
+    if (argc > 1 && string(argv[1]) == "--example8") {
+        vector<string> grid = {
+            "........",
+            "..##....",
+            "######..",
+            "..##.###",
+            "####....",
+            "...#....",
+            "..#####.",
+            "####.#.."
+        };
+
+        vector<Marker> markers = {
+            {1,3,5,'n',-1}, {2,0,2,'n',-1}, {2,1,5,'s',-1}, {2,5,4,'n',-1},
+            {3,7,2,'s',-1}, {3,0,2,'n',-1}, {5,3,5,'c',-1}, {6,3,6,'n',-1},
+            {6,4,6,'c',-1}, {7,1,4,'c',-1}, {7,5,4,'c',-1}
+        };
+
+        vector<Cell> cells;
+        vector<Vec3> pos;
+        BoxDims dims;
+        long long dfsIters = 0;
+
+        cerr << "Solving 8x8 example net...\n";
+        bool ok = solve_one_capture(grid, markers, cells, pos, dims, dfsIters);
+        if (!ok) {
+            cout << "No valid folding found for the 8x8 example.\n";
+            return 0;
+        }
+
+        cout << "Found valid folding for the 8x8 example!\n\n";
+        cout << "Face-labeled grid (1–6 for faces, . for empty):\n";
+        vector<string> faceGrid(grid.size(), string(grid[0].size(), '.'));
+        for (size_t i = 0; i < cells.size(); ++i) {
+            int r = cells[i].r;
+            int c = cells[i].c;
+            int f = face_id(pos[i], dims);
+            faceGrid[r][c] = char('0' + f);
+        }
+        for (auto &row : faceGrid) cout << row << "\n";
+        cout << "\nTotal DFS calls: " << dfsIters << "\n";
+        return 0;
+    }
 
     // Markers (0-based indices: row, col, value, type)
     vector<Marker> markers = {
