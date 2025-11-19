@@ -94,76 +94,6 @@ struct BoxDims {
     int minZ, maxZ;
 };
 
-int normal_id(const Vec3 &n);
-bool compute_box_dims_and_check(const vector<Vec3> &pos3d, int numCells, BoxDims &dims);
-
-// Tracks an in-progress rectangular prism embedding as cells are folded.
-struct RectangularPrism {
-    vector<Vec3> pos;
-    vector<Frame> frame;
-    vector<bool> assigned;
-    unordered_map<Vec3,int,Vec3Hash> occ;
-    vector<int> normalCount;
-    int assignedCount = 0;
-    int maxFaceArea;
-
-    RectangularPrism(int numCells, int faceLimit)
-        : pos(numCells),
-          frame(numCells),
-          assigned(numCells, false),
-          occ(numCells * 4),
-          normalCount(6, 0),
-          maxFaceArea(faceLimit) {}
-
-    void place_root(int idx, const Vec3 &p, const Frame &f) {
-        assigned[idx] = true;
-        pos[idx] = p;
-        frame[idx] = f;
-        occ[p] = idx;
-        assignedCount = 1;
-        int nid = normal_id(f.n);
-        if (nid >= 0) normalCount[nid]++;
-    }
-
-    bool can_place(int idx, const Vec3 &p) const {
-        return !assigned[idx] && occ.find(p) == occ.end();
-    }
-
-    bool place(int idx, const Vec3 &p, const Frame &f) {
-        if (!can_place(idx, p)) return false;
-
-        assigned[idx] = true;
-        pos[idx] = p;
-        frame[idx] = f;
-        occ[p] = idx;
-        ++assignedCount;
-
-        int nid = normal_id(f.n);
-        if (nid >= 0) normalCount[nid]++;
-
-        for (int k = 0; k < 6; ++k) {
-            if (normalCount[k] > maxFaceArea) {
-                unplace(idx);
-                return false;
-            }
-        }
-        return true;
-    }
-
-    void unplace(int idx) {
-        Vec3 p = pos[idx];
-        int nid = normal_id(frame[idx].n);
-        if (nid >= 0) normalCount[nid]--;
-        occ.erase(p);
-        assigned[idx] = false;
-        --assignedCount;
-    }
-
-    bool finalize(BoxDims &dims) const {
-        return compute_box_dims_and_check(pos, (int)pos.size(), dims);
-    }
-};
-
 // Given a surface area (number of cells) of a rectangular prism, return the
 // maximum possible area of any single face. This is used to prune embeddings:
 // if any outward normal already has more cells than the largest face could
@@ -513,6 +443,16 @@ bool solve_one_fast(const vector<string> &grid,
         if ((int)adj[i].size() > (int)adj[root].size()) root = i;
     }
 
+    assigned[root] = true;
+    pos3d[root] = {0,0,0};
+    frame3d[root] = { {1,0,0}, {0,1,0}, {0,0,1} };
+    occ[pos3d[root]] = root;
+    int assignedCount = 1;
+    {
+        int nid = normal_id(frame3d[root].n);
+        if (nid >= 0) normalCount[nid]++;
+    }
+
     prism.place_root(root, {0,0,0}, { {1,0,0}, {0,1,0}, {0,0,1} });
 
     auto compute_candidate_from_neighbor =
@@ -631,6 +571,29 @@ bool solve_one_fast(const vector<string> &grid,
             if (prism.place(b, candPos, candFrame)) {
                 if (dfs()) return true;
                 prism.unplace(b);
+            assigned[b] = true;
+            pos3d[b] = candPos;
+            frame3d[b] = candFrame;
+            occ[candPos] = b;
+            ++assignedCount;
+
+            int nid = normal_id(candFrame.n);
+            if (nid >= 0) normalCount[nid]++;
+
+            bool tooBigFace = false;
+            for (int k = 0; k < 6; ++k) {
+                if (normalCount[k] > maxFaceArea) {
+                    tooBigFace = true;
+                    break;
+                }
+            }
+
+            if (tooBigFace) {
+                if (nid >= 0) normalCount[nid]--;
+                --assignedCount;
+                occ.erase(candPos);
+                assigned[b] = false;
+                continue;
             }
         }
         return false;
@@ -701,6 +664,16 @@ bool solve_one_capture(const vector<string> &grid,
     int root = 0;
     for (int i = 1; i < numCells; ++i) {
         if ((int)adj[i].size() > (int)adj[root].size()) root = i;
+    }
+
+    assigned[root] = true;
+    pos3d[root] = {0,0,0};
+    frame3d[root] = { {1,0,0}, {0,1,0}, {0,0,1} };
+    occ[pos3d[root]] = root;
+    int assignedCount = 1;
+    {
+        int nid = normal_id(frame3d[root].n);
+        if (nid >= 0) normalCount[nid]++;
     }
 
     prism.place_root(root, {0,0,0}, { {1,0,0}, {0,1,0}, {0,0,1} });
@@ -821,6 +794,29 @@ bool solve_one_capture(const vector<string> &grid,
             if (prism.place(b, candPos, candFrame)) {
                 if (dfs()) return true;
                 prism.unplace(b);
+            assigned[b] = true;
+            pos3d[b] = candPos;
+            frame3d[b] = candFrame;
+            occ[candPos] = b;
+            ++assignedCount;
+
+            int nid = normal_id(candFrame.n);
+            if (nid >= 0) normalCount[nid]++;
+
+            bool tooBigFace = false;
+            for (int k = 0; k < 6; ++k) {
+                if (normalCount[k] > maxFaceArea) {
+                    tooBigFace = true;
+                    break;
+                }
+            }
+
+            if (tooBigFace) {
+                if (nid >= 0) normalCount[nid]--;
+                --assignedCount;
+                occ.erase(candPos);
+                assigned[b] = false;
+                continue;
             }
         }
         return false;
