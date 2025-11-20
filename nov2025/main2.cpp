@@ -346,8 +346,65 @@ int normal_id(const Vec3 &n) {
     return -1; // shouldn't happen if frames are orthonormal
 }
 
+struct RectangularPrism {
+    vector<Vec3> pos;
+    vector<Frame> frame;
+    vector<bool> assigned;
+    unordered_map<Vec3, int, Vec3Hash> occ;
+    array<int, 6> normalCount{};
+    int assignedCount = 0;
+    int maxFaceArea;
+    int numCells;
+
+    RectangularPrism(int n, int maxFace)
+        : pos(n), frame(n), assigned(n, false), maxFaceArea(maxFace), numCells(n) {}
+
+    void reset() {
+        fill(assigned.begin(), assigned.end(), false);
+        occ.clear();
+        assignedCount = 0;
+        normalCount.fill(0);
+    }
+
+    bool place_root(int idx, const Vec3 &p, const Frame &f) {
+        reset();
+        return place(idx, p, f);
+    }
+
+    bool place(int idx, const Vec3 &p, const Frame &f) {
+        if (idx < 0 || idx >= numCells) return false;
+        if (assigned[idx]) return false;
+        if (occ.find(p) != occ.end()) return false;
+
+        int nid = normal_id(f.n);
+        if (nid < 0) return false;
+        if (normalCount[nid] + 1 > maxFaceArea) return false;
+
+        pos[idx] = p;
+        frame[idx] = f;
+        assigned[idx] = true;
+        occ[p] = idx;
+        assignedCount++;
+        normalCount[nid]++;
+        return true;
+    }
+
+    void unplace(int idx) {
+        if (!assigned[idx]) return;
+        int nid = normal_id(frame[idx].n);
+        if (nid >= 0) normalCount[nid]--;
+        occ.erase(pos[idx]);
+        assigned[idx] = false;
+        assignedCount--;
+    }
+
+    bool finalize(BoxDims &dims) {
+        if (assignedCount != numCells) return false;
+        return compute_box_dims_and_check(pos, numCells, dims);
+    }
+};
+
 void print_partial_grid(const vector<Cell> &cells,
-                        const vector<Vec3> &pos,
                         const vector<Frame> &frame,
                         const vector<bool> &assigned,
                         int R, int C)
@@ -443,20 +500,10 @@ bool solve_one_fast(const vector<string> &grid,
         if ((int)adj[i].size() > (int)adj[root].size()) root = i;
     }
 
-    assigned[root] = true;
-    pos3d[root] = {0,0,0};
-    frame3d[root] = { {1,0,0}, {0,1,0}, {0,0,1} };
-    occ[pos3d[root]] = root;
-    int assignedCount = 1;
-    {
-        int nid = normal_id(frame3d[root].n);
-        if (nid >= 0) normalCount[nid]++;
-    }
-
     prism.place_root(root, {0,0,0}, { {1,0,0}, {0,1,0}, {0,0,1} });
 
     auto compute_candidate_from_neighbor =
-        [&](int a, int b, Dir d, int mode, Vec3 &candPos, Frame &candFrame) {
+        [&](int a, Dir d, int mode, Vec3 &candPos, Frame &candFrame) {
             const Frame &fa = prism.frame[a];
             const Vec3 &pa = prism.pos[a];
             Vec3 step = step_from_frame(fa, d);
@@ -501,7 +548,7 @@ bool solve_one_fast(const vector<string> &grid,
             bool okNeighbor = false;
             for (int mode = 0; mode < 3; ++mode) {
                 Vec3 p2; Frame f2;
-                compute_candidate_from_neighbor(nb, b, dnb, mode, p2, f2);
+                compute_candidate_from_neighbor(nb, dnb, mode, p2, f2);
                 if (p2 == candPos && f2 == candFrame) {
                     okNeighbor = true;
                     break;
@@ -524,11 +571,11 @@ bool solve_one_fast(const vector<string> &grid,
                 cerr << "Sol #" << (solIndex + 1)
                      << " DFS iters (fast): " << dfsIters << "\n";
 
-                print_partial_grid(cells, prism.pos, prism.frame, prism.assigned, R, C);
+                print_partial_grid(cells, prism.frame, prism.assigned, R, C);
             } else {
                 cerr << "Sol #" << (solIndex + 1)
                      << " DFS iters (fast): " << dfsIters << "\n";
-                print_partial_grid(cells, prism.pos, prism.frame, prism.assigned, R, C);
+                print_partial_grid(cells, prism.frame, prism.assigned, R, C);
             }
         }
 
@@ -563,7 +610,7 @@ bool solve_one_fast(const vector<string> &grid,
         for (int mode = 0; mode < 3; ++mode) { // 0: same, 1: +90, 2: -90
             Vec3 candPos;
             Frame candFrame;
-            compute_candidate_from_neighbor(a, b, dirFromAtoB, mode, candPos, candFrame);
+            compute_candidate_from_neighbor(a, dirFromAtoB, mode, candPos, candFrame);
 
             if (prism.occ.find(candPos) != prism.occ.end()) continue;
             if (!candidate_compatible(b, candPos, candFrame)) continue;
@@ -571,29 +618,6 @@ bool solve_one_fast(const vector<string> &grid,
             if (prism.place(b, candPos, candFrame)) {
                 if (dfs()) return true;
                 prism.unplace(b);
-            assigned[b] = true;
-            pos3d[b] = candPos;
-            frame3d[b] = candFrame;
-            occ[candPos] = b;
-            ++assignedCount;
-
-            int nid = normal_id(candFrame.n);
-            if (nid >= 0) normalCount[nid]++;
-
-            bool tooBigFace = false;
-            for (int k = 0; k < 6; ++k) {
-                if (normalCount[k] > maxFaceArea) {
-                    tooBigFace = true;
-                    break;
-                }
-            }
-
-            if (tooBigFace) {
-                if (nid >= 0) normalCount[nid]--;
-                --assignedCount;
-                occ.erase(candPos);
-                assigned[b] = false;
-                continue;
             }
         }
         return false;
@@ -666,20 +690,10 @@ bool solve_one_capture(const vector<string> &grid,
         if ((int)adj[i].size() > (int)adj[root].size()) root = i;
     }
 
-    assigned[root] = true;
-    pos3d[root] = {0,0,0};
-    frame3d[root] = { {1,0,0}, {0,1,0}, {0,0,1} };
-    occ[pos3d[root]] = root;
-    int assignedCount = 1;
-    {
-        int nid = normal_id(frame3d[root].n);
-        if (nid >= 0) normalCount[nid]++;
-    }
-
     prism.place_root(root, {0,0,0}, { {1,0,0}, {0,1,0}, {0,0,1} });
 
     auto compute_candidate_from_neighbor =
-        [&](int a, int b, Dir d, int mode, Vec3 &candPos, Frame &candFrame) {
+        [&](int a, Dir d, int mode, Vec3 &candPos, Frame &candFrame) {
             const Frame &fa = prism.frame[a];
             const Vec3 &pa = prism.pos[a];
             Vec3 step = step_from_frame(fa, d);
@@ -717,7 +731,7 @@ bool solve_one_capture(const vector<string> &grid,
             bool okNeighbor = false;
             for (int mode = 0; mode < 3; ++mode) {
                 Vec3 p2; Frame f2;
-                compute_candidate_from_neighbor(nb, b, dnb, mode, p2, f2);
+                compute_candidate_from_neighbor(nb, dnb, mode, p2, f2);
                 if (p2 == candPos && f2 == candFrame) {
                     okNeighbor = true;
                     break;
@@ -786,7 +800,7 @@ bool solve_one_capture(const vector<string> &grid,
         for (int mode = 0; mode < 3; ++mode) {
             Vec3 candPos;
             Frame candFrame;
-            compute_candidate_from_neighbor(a, b, dirFromAtoB, mode, candPos, candFrame);
+            compute_candidate_from_neighbor(a, dirFromAtoB, mode, candPos, candFrame);
 
             if (prism.occ.find(candPos) != prism.occ.end()) continue;
             if (!candidate_compatible(b, candPos, candFrame)) continue;
@@ -794,29 +808,6 @@ bool solve_one_capture(const vector<string> &grid,
             if (prism.place(b, candPos, candFrame)) {
                 if (dfs()) return true;
                 prism.unplace(b);
-            assigned[b] = true;
-            pos3d[b] = candPos;
-            frame3d[b] = candFrame;
-            occ[candPos] = b;
-            ++assignedCount;
-
-            int nid = normal_id(candFrame.n);
-            if (nid >= 0) normalCount[nid]++;
-
-            bool tooBigFace = false;
-            for (int k = 0; k < 6; ++k) {
-                if (normalCount[k] > maxFaceArea) {
-                    tooBigFace = true;
-                    break;
-                }
-            }
-
-            if (tooBigFace) {
-                if (nid >= 0) normalCount[nid]--;
-                --assignedCount;
-                occ.erase(candPos);
-                assigned[b] = false;
-                continue;
             }
         }
         return false;
