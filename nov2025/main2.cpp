@@ -1,1089 +1,998 @@
-#include <iostream>
-#include <vector>
-#include <string>
-#include <fstream>
-#include <unordered_map>
-#include <thread>
-#include <atomic>
-#include <functional>
-#include <mutex>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <climits>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 using namespace std;
 
-// ----------------- Basic 3D vector / frame types -----------------
+namespace {
 
-struct Vec3 {
-    int x, y, z;
-    bool operator==(const Vec3 &o) const {
-        return x == o.x && y == o.y && z == o.z;
-    }
-};
+constexpr bool ENFORCE_MARKER_RULES = true;
+const long long REPORT_EVERY = 1000000; // DFS progress print interval
 
-struct Vec3Hash {
-    size_t operator()(const Vec3 &v) const noexcept {
-        return (uint64_t(v.x) * 1315423911u)
-             ^ (uint64_t(v.y) * 2654435761u)
-             ^ (uint64_t(v.z) * 97531u);
-    }
-};
-
-struct Frame {
-    Vec3 u, v, n; // in-plane axes + normal
-    bool operator==(const Frame &o) const {
-        return u == o.u && v == o.v && n == o.n;
-    }
-};
-
-inline Vec3 operator+(const Vec3 &a, const Vec3 &b) {
-    return {a.x + b.x, a.y + b.y, a.z + b.z};
-}
-inline Vec3 operator-(const Vec3 &a, const Vec3 &b) {
-    return {a.x - b.x, a.y - b.y, a.z - b.z};
-}
-inline Vec3 operator-(const Vec3 &a) {
-    return {-a.x, -a.y, -a.z};
-}
-inline int dot(const Vec3 &a, const Vec3 &b) {
-    return a.x*b.x + a.y*b.y + a.z*b.z;
-}
-inline Vec3 cross(const Vec3 &a, const Vec3 &b) {
-    return {
-        a.y*b.z - a.z*b.y,
-        a.z*b.x - a.x*b.z,
-        a.x*b.y - a.y*b.x
-    };
-}
-
-// rotate v by +90 degrees around 'axis' (right-hand rule)
-Vec3 rotate90_plus(const Vec3 &v, const Vec3 &axis) {
-    if (dot(v, axis) != 0) return v; // parallel to axis
-    return cross(axis, v);
-}
-
-// rotate v by -90 degrees around 'axis'
-Vec3 rotate90_minus(const Vec3 &v, const Vec3 &axis) {
-    if (dot(v, axis) != 0) return v; // parallel to axis
-    return cross(v, axis);
-}
-
-// ----------------- Net / grid representation -----------------
-
-struct Cell {
-    int r, c; // 0-based row/col in the net
-};
-
-enum Dir { UP = 0, DOWN = 1, LEFT = 2, RIGHT = 3 };
-
-struct Edge {
-    int to;
-    Dir dir;
-};
+// Global stop flag and logging mutex
+atomic<bool> g_stop{false};
+mutex g_cerrMutex;
+atomic<int> g_winnerIndex{-1};
 
 struct Marker {
-    int r, c;    // 0-based net coordinates
-    int val;     // number (not used in constraints)
-    char type;   // 'n', 'c', 's'
-    int cellIndex; // index in cells, or -1 if not on '#'
+    int row = 0;
+    int col = 0;
+    char type = 's'; // 's' square, 'c' circle
 };
 
-struct BoxDims {
-    int minX, maxX;
-    int minY, maxY;
-    int minZ, maxZ;
+struct Net {
+    string header;
+    vector<string> rows;
+    int index = -1;
+    int totalTiles = 0;
+    vector<Marker> markers;
 };
 
-// Given a surface area (number of cells) of a rectangular prism, return the
-// maximum possible area of any single face. This is used to prune embeddings:
-// if any outward normal already has more cells than the largest face could
-// hold, the partial embedding cannot ever close into a box.
-int max_face_area_from_surface(int surfaceCells) {
-    // surfaceCells = 2 * (a*b + a*c + b*c)
-    if (surfaceCells <= 0 || surfaceCells % 2 != 0) return surfaceCells;
-    int half = surfaceCells / 2;
-    int best = 0;
+struct ProcessResult {
+    bool valid = false;
+    string header;
+    int index = -1;
+    int totalTiles = 0;
+    int Lx = 0, Ly = 0, Lz = 0;
+    int rootPatch = -1;
+    vector<string> labeledGrid;
+    vector<string> originalGrid;
+    vector<string> mappingLines;
+    string failureReason;
+    long long dfsIterations = 0;
+};
 
-    for (int a = 1; a * a <= half; ++a) {
-        for (int b = 1; a * b <= half; ++b) {
-            int rhs = half - a * b; // a*c + b*c
+struct Patch {
+    int axis;
+    int sign;
+    int i;
+    int j;
+    int nx;
+    int ny;
+    int nz;
+};
+
+struct PrismData {
+    int Lx = 0;
+    int Ly = 0;
+    int Lz = 0;
+    vector<Patch> patches;
+    vector<vector<int>> adj;
+    vector<vector<char>> adjMatrix;
+    vector<int> oppPatch;  // index of opposite patch for each patch
+};
+
+int faceLabel(const Patch &p) {
+    if (p.axis == 0) return (p.sign == -1 ? 1 : 2);
+    if (p.axis == 1) return (p.sign == -1 ? 3 : 4);
+    return (p.sign == -1 ? 5 : 6);
+}
+
+class FoldingSolver {
+public:
+    explicit FoldingSolver(vector<string> gridInput, int netIndex)
+        : netIndex(netIndex) {
+        if (gridInput.empty()) {
+            H = 0;
+            W = 0;
+            return;
+        }
+        H = static_cast<int>(gridInput.size());
+        W = 0;
+        for (const auto &row : gridInput) {
+            W = max(W, static_cast<int>(row.size()));
+        }
+        grid = std::move(gridInput);
+        for (auto &row : grid) {
+            if (static_cast<int>(row.size()) < W) {
+                row += string(W - row.size(), '.');
+            }
+        }
+        buildTilesAndAdj();
+
+        tileMarker.assign(T, 'n');
+        circleTiles.clear();
+        squareTiles.clear();
+    }
+
+    // markers: vector of (row, col, type), type in {'c','s'}
+    void setMarkers(const vector<tuple<int,int,char>> &marks) {
+        tileMarker.assign(T, 'n');
+        circleTiles.clear();
+        squareTiles.clear();
+
+        for (auto &mk : marks) {
+            int r, c;
+            char tp;
+            tie(r, c, tp) = mk;
+
+            int tid = -1;
+            for (int t = 0; t < T; ++t) {
+                if (tiles[t].first == r && tiles[t].second == c) {
+                    tid = t;
+                    break;
+                }
+            }
+            if (tid == -1) continue; // marker on '.'
+
+            if (tp == 'c') {
+                tileMarker[tid] = 'c';
+                circleTiles.push_back(tid);
+            } else if (tp == 's') {
+                tileMarker[tid] = 's';
+                squareTiles.push_back(tid);
+            }
+        }
+    }
+
+    bool solveForDims(int lx, int ly, int lz,
+                      vector<int> &assignmentOut,
+                      int &rootPatchUsed) {
+        dfsIterations = 0;
+        if (T == 0) return false;
+        PrismData prism = buildPrism(lx, ly, lz);
+        if (static_cast<int>(prism.patches.size()) != T) {
+            return false;
+        }
+
+        tileToPatch.assign(T, -1);
+        patchUsed.assign(prism.patches.size(), 0);
+        solutionFound = false;
+        finalAssignment.clear();
+        allSolutions.clear();
+        currentPrism = &prism;
+        dimLx = lx;
+        dimLy = ly;
+        dimLz = lz;
+
+        const int P = static_cast<int>(prism.patches.size());
+        canUse.assign(T, vector<char>(P, 1));
+        candCount.assign(T, 0);
+
+        for (int t = 0; t < T; ++t) {
+            int tileDeg = static_cast<int>(tileAdj[t].size());
+            int count = 0;
+            for (int p = 0; p < P; ++p) {
+                int patchDeg = static_cast<int>(prism.adj[p].size());
+                if (patchDeg < tileDeg) {
+                    canUse[t][p] = 0;
+                } else {
+                    canUse[t][p] = 1;
+                    ++count;
+                }
+            }
+            candCount[t] = count;
+        }
+
+        const int rootTile = 0;
+        for (int rootPatch = 0; rootPatch < P; ++rootPatch) {
+            if (g_stop.load(memory_order_relaxed)) return false;
+
+            fill(tileToPatch.begin(), tileToPatch.end(), -1);
+            fill(patchUsed.begin(), patchUsed.end(), 0);
+            solutionFound = false;
+
+            for (int t = 0; t < T; ++t) {
+                int tileDeg = static_cast<int>(tileAdj[t].size());
+                int count = 0;
+                for (int p = 0; p < P; ++p) {
+                    int patchDeg = static_cast<int>(prism.adj[p].size());
+                    if (patchDeg < tileDeg) {
+                        canUse[t][p] = 0;
+                    } else {
+                        canUse[t][p] = 1;
+                        ++count;
+                    }
+                }
+                candCount[t] = count;
+            }
+
+            tileToPatch[rootTile] = rootPatch;
+            patchUsed[rootPatch] = 1;
+
+            if (!checkCirclePartial(rootTile, rootPatch) ||
+                !checkSquarePartial(rootTile, rootPatch)) {
+                tileToPatch[rootTile] = -1;
+                patchUsed[rootPatch] = 0;
+                continue;
+            }
+
+            vector<pair<int,int>> changes;
+            if (!propagateConstraints(rootTile, rootPatch, changes)) {
+                tileToPatch[rootTile] = -1;
+                patchUsed[rootPatch] = 0;
+                continue;
+            }
+
+            if (dfsAssign(1, rootPatch)) {
+                if (ENFORCE_MARKER_RULES) {
+                    assignmentOut = finalAssignment;
+                    rootPatchUsed = rootPatch;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    vector<string> buildLabeledGrid(const vector<int> &assignment,
+                                    int lx, int ly, int lz) const {
+        PrismData prism = buildPrism(lx, ly, lz);
+        vector<string> labeled(H, string(W, '.'));
+        for (int t = 0; t < T; ++t) {
+            auto [r, c] = tiles[t];
+            const Patch &p = prism.patches[assignment[t]];
+            labeled[r][c] = static_cast<char>('0' + faceLabel(p));
+        }
+        return labeled;
+    }
+
+    vector<string> describeAssignment(const vector<int> &assignment,
+                                      int lx, int ly, int lz) const {
+        PrismData prism = buildPrism(lx, ly, lz);
+        vector<string> lines;
+        lines.reserve(T);
+        for (int t = 0; t < T; ++t) {
+            auto [r, c] = tiles[t];
+            const Patch &p = prism.patches[assignment[t]];
+            ostringstream oss;
+            oss << "Tile (" << r << "," << c << ") -> axis=" << p.axis
+                << ", sign=" << p.sign
+                << ", i=" << p.i
+                << ", j=" << p.j
+                << ", n=(" << p.nx << "," << p.ny << "," << p.nz << ")";
+            if (tileMarker[t] == 'c') oss << " [circle]";
+            if (tileMarker[t] == 's') oss << " [square]";
+            lines.push_back(oss.str());
+        }
+        return lines;
+    }
+
+    int tileCount() const { return T; }
+    int getSolutionCount() const { return static_cast<int>(allSolutions.size()); }
+    long long getIterationCount() const { return dfsIterations; }
+
+private:
+    int H = 0;
+    int W = 0;
+    int T = 0;
+    vector<string> grid;
+    vector<pair<int,int>> tiles;
+    vector<vector<int>> tileAdj;
+
+    mutable vector<int> tileToPatch;
+    mutable vector<char> patchUsed;
+    mutable bool solutionFound = false;
+    mutable vector<int> finalAssignment;
+    mutable vector<pair<vector<int>, int>> allSolutions;
+    mutable const PrismData *currentPrism = nullptr;
+
+    mutable vector<vector<char>> canUse;
+    mutable vector<int> candCount;
+
+    mutable vector<char> tileMarker;     // 'n', 'c', 's'
+    mutable vector<int> circleTiles;
+    mutable vector<int> squareTiles;
+
+    mutable long long dfsIterations = 0;
+    int netIndex = -1;
+    int dimLx = 0, dimLy = 0, dimLz = 0;
+
+    void buildTilesAndAdj() {
+        tiles.clear();
+        vector<vector<int>> coord(H, vector<int>(W, -1));
+        for (int r = 0; r < H; ++r) {
+            for (int c = 0; c < W; ++c) {
+                if (grid[r][c] == '#') {
+                    coord[r][c] = static_cast<int>(tiles.size());
+                    tiles.push_back({r, c});
+                }
+            }
+        }
+        T = static_cast<int>(tiles.size());
+        tileAdj.assign(T, {});
+        const int dr[4] = {-1, 1, 0, 0};
+        const int dc[4] = {0, 0, -1, 1};
+        for (int t = 0; t < T; ++t) {
+            auto [r, c] = tiles[t];
+            for (int k = 0; k < 4; ++k) {
+                int nr = r + dr[k];
+                int nc = c + dc[k];
+                if (nr < 0 || nr >= H || nc < 0 || nc >= W) continue;
+                int nt = coord[nr][nc];
+                if (nt != -1) tileAdj[t].push_back(nt);
+            }
+        }
+    }
+
+    PrismData buildPrism(int lx, int ly, int lz) const {
+        PrismData data;
+        data.Lx = lx;
+        data.Ly = ly;
+        data.Lz = lz;
+
+        auto addPatches = [&](int axis, int sign, int d1, int d2) {
+            for (int i = 0; i < d1; ++i) {
+                for (int j = 0; j < d2; ++j) {
+                    Patch p;
+                    p.axis = axis;
+                    p.sign = sign;
+                    p.i = i;
+                    p.j = j;
+                    p.nx = (axis == 0 ? (sign == -1 ? -1 : 1) : 0);
+                    p.ny = (axis == 1 ? (sign == -1 ? -1 : 1) : 0);
+                    p.nz = (axis == 2 ? (sign == -1 ? -1 : 1) : 0);
+                    data.patches.push_back(p);
+                }
+            }
+        };
+
+        addPatches(0, -1, ly, lz);
+        addPatches(0, +1, ly, lz);
+        addPatches(1, -1, lx, lz);
+        addPatches(1, +1, lx, lz);
+        addPatches(2, -1, lx, ly);
+        addPatches(2, +1, lx, ly);
+
+        const int P = static_cast<int>(data.patches.size());
+        data.adj.assign(P, {});
+
+        const int vx = lx + 1;
+        const int vy = ly + 1;
+        const int vz = lz + 1;
+        vector<int> vertexId(vx * vy * vz, -1);
+        int vCount = 0;
+        auto vertexIndex = [&](int x, int y, int z) -> int {
+            return ((x * vy) + y) * vz + z;
+        };
+        auto getVertexId = [&](int x, int y, int z) -> int {
+            int idx = vertexIndex(x, y, z);
+            int &ref = vertexId[idx];
+            if (ref == -1) ref = vCount++;
+            return ref;
+        };
+
+        unordered_map<long long, vector<int>> edgeOwners;
+        edgeOwners.reserve(P * 4);
+
+        auto addEdge = [&](int patchIdx, int a, int b) {
+            if (a > b) swap(a, b);
+            long long key =
+                (static_cast<long long>(a) << 32) |
+                static_cast<unsigned int>(b);
+            edgeOwners[key].push_back(patchIdx);
+        };
+
+        for (int idx = 0; idx < P; ++idx) {
+            const Patch &p = data.patches[idx];
+            vector<array<int,3>> corners(4);
+            if (p.axis == 0) {
+                int x = (p.sign == -1 ? 0 : lx);
+                int y = p.i;
+                int z = p.j;
+                corners[0] = {x, y, z};
+                corners[1] = {x, y+1, z};
+                corners[2] = {x, y+1, z+1};
+                corners[3] = {x, y,   z+1};
+            } else if (p.axis == 1) {
+                int y = (p.sign == -1 ? 0 : ly);
+                int x = p.i;
+                int z = p.j;
+                corners[0] = {x,   y, z};
+                corners[1] = {x+1, y, z};
+                corners[2] = {x+1, y, z+1};
+                corners[3] = {x,   y, z+1};
+            } else {
+                int z = (p.sign == -1 ? 0 : lz);
+                int x = p.i;
+                int y = p.j;
+                corners[0] = {x,   y,   z};
+                corners[1] = {x+1, y,   z};
+                corners[2] = {x+1, y+1, z};
+                corners[3] = {x,   y+1, z};
+            }
+
+            vector<int> vids(4);
+            for (int k = 0; k < 4; ++k) {
+                vids[k] = getVertexId(corners[k][0],
+                                      corners[k][1],
+                                      corners[k][2]);
+            }
+            for (int k = 0; k < 4; ++k) {
+                addEdge(idx, vids[k], vids[(k+1)%4]);
+            }
+        }
+
+        for (auto &kv : edgeOwners) {
+            const vector<int> &owners = kv.second;
+            for (size_t i = 0; i < owners.size(); ++i) {
+                for (size_t j = i+1; j < owners.size(); ++j) {
+                    int a = owners[i];
+                    int b = owners[j];
+                    data.adj[a].push_back(b);
+                    data.adj[b].push_back(a);
+                }
+            }
+        }
+
+        for (auto &lst : data.adj) {
+            sort(lst.begin(), lst.end());
+            lst.erase(unique(lst.begin(), lst.end()), lst.end());
+        }
+
+        data.adjMatrix.assign(P, vector<char>(P, 0));
+        for (int i = 0; i < P; ++i) {
+            for (int j : data.adj[i]) {
+                data.adjMatrix[i][j] = 1;
+            }
+        }
+
+        data.oppPatch.assign(P, -1);
+        for (int i = 0; i < P; ++i) {
+            const Patch &A = data.patches[i];
+            for (int j = 0; j < P; ++j) {
+                const Patch &B = data.patches[j];
+                if (A.axis == B.axis &&
+                    A.i    == B.i    &&
+                    A.j    == B.j    &&
+                    A.sign == -B.sign) {
+                    data.oppPatch[i] = j;
+                    break;
+                }
+            }
+        }
+
+        return data;
+    }
+
+    int chooseNextTile() const {
+        int best = -1;
+        int bestAvail = INT_MAX;
+        int bestAssignedNbrs = -1;
+        int bestDeg = -1;
+
+        const int P = static_cast<int>(currentPrism->patches.size());
+
+        for (int t = 0; t < T; ++t) {
+            if (tileToPatch[t] != -1) continue;
+
+            int assignedNbrs = 0;
+            for (int nb : tileAdj[t]) {
+                if (tileToPatch[nb] != -1) ++assignedNbrs;
+            }
+            int deg = static_cast<int>(tileAdj[t].size());
+
+            int avail = 0;
+            for (int p = 0; p < P; ++p) {
+                if (canUse[t][p] && !patchUsed[p]) ++avail;
+            }
+
+            if (avail < bestAvail ||
+                (avail == bestAvail && assignedNbrs > bestAssignedNbrs) ||
+                (avail == bestAvail && assignedNbrs == bestAssignedNbrs && deg > bestDeg)) {
+                bestAvail = avail;
+                bestAssignedNbrs = assignedNbrs;
+                bestDeg = deg;
+                best = t;
+            }
+        }
+        return best;
+    }
+
+    bool checkCirclePartial(int tileIdx, int patchIdx) const {
+        if (!ENFORCE_MARKER_RULES) return true;
+        if (tileMarker.empty() || tileMarker[tileIdx] != 'c') return true;
+
+        int op = currentPrism->oppPatch[patchIdx];
+        if (op < 0) return false;
+
+        for (int t = 0; t < T; ++t) {
+            if (tileToPatch[t] == op) {
+                if (tileMarker[t] != 'c') return false;
+                return true;
+            }
+        }
+
+        for (int t : circleTiles) {
+            if (t == tileIdx) continue;
+            if (tileToPatch[t] != -1) continue;
+            if (canUse[t][op] && !patchUsed[op]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool checkSquarePartial(int tileIdx, int patchIdx) const {
+        if (!ENFORCE_MARKER_RULES) return true;
+        if (tileMarker.empty() || tileMarker[tileIdx] != 's') return true;
+        if (squareTiles.size() < 2) return false;
+
+        const Patch &P = currentPrism->patches[patchIdx];
+
+        for (int t : squareTiles) {
+            if (t == tileIdx) continue;
+            int p2 = tileToPatch[t];
+            if (p2 == -1) continue;
+            const Patch &Q = currentPrism->patches[p2];
+            if (Q.axis == P.axis && Q.sign == P.sign &&
+                currentPrism->adjMatrix[patchIdx][p2]) {
+                return true;
+            }
+        }
+
+        const int Pcount = static_cast<int>(currentPrism->patches.size());
+        for (int t : squareTiles) {
+            if (t == tileIdx) continue;
+            if (tileToPatch[t] != -1) continue;
+
+            for (int q = 0; q < Pcount; ++q) {
+                if (!canUse[t][q]) continue;
+                if (patchUsed[q]) continue;
+                const Patch &Q = currentPrism->patches[q];
+                if (Q.axis != P.axis || Q.sign != P.sign) continue;
+                if (!currentPrism->adjMatrix[patchIdx][q]) continue;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool finalCircleCheck() const {
+        if (!ENFORCE_MARKER_RULES) return true;
+        for (int t : circleTiles) {
+            int p = tileToPatch[t];
+            if (p < 0) return false;
+            int op = currentPrism->oppPatch[p];
+            if (op < 0) return false;
+            bool ok = false;
+            for (int t2 : circleTiles) {
+                if (t2 == t) continue;
+                if (tileToPatch[t2] == op) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    bool finalSquareCheck() const {
+        if (!ENFORCE_MARKER_RULES) return true;
+        for (int t : squareTiles) {
+            int p = tileToPatch[t];
+            if (p < 0) return false;
+            const Patch &P = currentPrism->patches[p];
+            bool ok = false;
+            for (int t2 : squareTiles) {
+                if (t2 == t) continue;
+                int p2 = tileToPatch[t2];
+                if (p2 < 0) return false;
+                const Patch &Q = currentPrism->patches[p2];
+                if (Q.axis == P.axis && Q.sign == P.sign &&
+                    currentPrism->adjMatrix[p][p2]) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    bool propagateConstraints(int tileIdx, int patchIdx,
+                              vector<pair<int,int>> &changes) const {
+        const int P = static_cast<int>(currentPrism->patches.size());
+
+        for (int nb : tileAdj[tileIdx]) {
+            if (tileToPatch[nb] != -1) continue;
+
+            for (int q = 0; q < P; ++q) {
+                if (!canUse[nb][q]) continue;
+                if (!currentPrism->adjMatrix[q][patchIdx]) {
+                    canUse[nb][q] = 0;
+                    --candCount[nb];
+                    changes.emplace_back(nb, q);
+                }
+            }
+            if (candCount[nb] == 0) return false;
+
+            bool hasFree = false;
+            for (int q = 0; q < P; ++q) {
+                if (canUse[nb][q] && !patchUsed[q]) {
+                    hasFree = true;
+                    break;
+                }
+            }
+            if (!hasFree) return false;
+        }
+        return true;
+    }
+
+    bool dfsAssign(int assignedCount, int rootPatch) const {
+        if (g_stop.load(memory_order_relaxed)) return false;
+
+        ++dfsIterations;
+        if (dfsIterations % REPORT_EVERY == 0) {
+            lock_guard<mutex> lock(g_cerrMutex);
+            cerr << "\r[Net " << (netIndex + 1)
+                 << " " << dimLx << "x" << dimLy << "x" << dimLz
+                 << "] DFS calls: " << dfsIterations << flush;
+        }
+
+        if (assignedCount == T) {
+            if (!finalCircleCheck()) return false;
+            if (!finalSquareCheck()) return false;
+
+            allSolutions.emplace_back(tileToPatch, rootPatch);
+
+            if (ENFORCE_MARKER_RULES) {
+                solutionFound = true;
+                finalAssignment = tileToPatch;
+                return true;
+            }
+            return false;
+        }
+
+        int tileIdx = chooseNextTile();
+        if (tileIdx == -1) return false;
+
+        const int patchCount = static_cast<int>(currentPrism->patches.size());
+
+        for (int p = 0; p < patchCount; ++p) {
+            if (!canUse[tileIdx][p]) continue;
+            if (patchUsed[p]) continue;
+
+            bool ok = true;
+            for (int nb : tileAdj[tileIdx]) {
+                int assignedPatch = tileToPatch[nb];
+                if (assignedPatch == -1) continue;
+                if (!currentPrism->adjMatrix[p][assignedPatch]) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
+
+            if (!checkCirclePartial(tileIdx, p)) continue;
+            if (!checkSquarePartial(tileIdx, p)) continue;
+
+            tileToPatch[tileIdx] = p;
+            patchUsed[p] = 1;
+
+            vector<pair<int,int>> changes;
+            if (propagateConstraints(tileIdx, p, changes)) {
+                if (dfsAssign(assignedCount + 1, -1)) return true;
+            }
+
+            for (auto &chg : changes) {
+                int t = chg.first;
+                int q = chg.second;
+                if (!canUse[t][q]) {
+                    canUse[t][q] = 1;
+                    ++candCount[t];
+                }
+            }
+
+            tileToPatch[tileIdx] = -1;
+            patchUsed[p] = 0;
+
+            if (g_stop.load(memory_order_relaxed)) return false;
+        }
+        return false;
+    }
+};
+
+vector<tuple<int,int,int>> enumerateTriples(int halfArea) {
+    vector<tuple<int,int,int>> triples;
+    for (int a = 1; a <= halfArea; ++a) {
+        for (int b = a; b <= halfArea; ++b) {
             int denom = a + b;
-            if (rhs <= 0 || rhs % denom != 0) continue;
-            int c = rhs / denom;
-            if (c <= 0) continue;
-            int face1 = a * b;
-            int face2 = a * c;
-            int face3 = b * c;
-            best = max({best, face1, face2, face3});
+            int numer = halfArea - a * b;
+            if (denom <= 0 || numer <= 0) continue;
+            if (numer % denom != 0) continue;
+            int c = numer / denom;
+            if (c < b) continue;
+            triples.emplace_back(a, b, c);
         }
     }
-
-    if (best == 0) return surfaceCells; // fallback (should not happen for valid nets)
-    return best;
+    return triples;
 }
 
-// ----------------- Box and marker checks -----------------
-
-bool compute_box_dims_and_check(const vector<Vec3> &pos3d, int numCells, BoxDims &dims) {
-    if (numCells == 0) return false;
-
-    bool first = true;
-    for (int i = 0; i < numCells; ++i) {
-        Vec3 p = pos3d[i];
-        if (first) {
-            dims.minX = dims.maxX = p.x;
-            dims.minY = dims.maxY = p.y;
-            dims.minZ = dims.maxZ = p.z;
-            first = false;
-        } else {
-            dims.minX = min(dims.minX, p.x);
-            dims.maxX = max(dims.maxX, p.x);
-            dims.minY = min(dims.minY, p.y);
-            dims.maxY = max(dims.maxY, p.y);
-            dims.minZ = min(dims.minZ, p.z);
-            dims.maxZ = max(dims.maxZ, p.z);
-        }
-    }
-
-    auto check_face = [&](auto getterKey, auto isOnPlane) -> bool {
-        vector<pair<int,int>> pts;
-        pts.reserve(numCells);
-        for (int i = 0; i < numCells; ++i) {
-            if (!isOnPlane(i)) continue;
-            pts.push_back(getterKey(i));
-        }
-        if (pts.empty()) return false;
-        int minA = pts[0].first, maxA = pts[0].first;
-        int minB = pts[0].second, maxB = pts[0].second;
-        for (auto &p : pts) {
-            minA = min(minA, p.first);
-            maxA = max(maxA, p.first);
-            minB = min(minB, p.second);
-            maxB = max(maxB, p.second);
-        }
-        int expected = (maxA - minA + 1) * (maxB - minB + 1);
-        return (int)pts.size() == expected;
-    };
-
-    bool ok = true;
-    ok &= check_face(
-        [&](int i) { return make_pair(pos3d[i].y, pos3d[i].z); },
-        [&](int i) { return pos3d[i].x == dims.minX; }
-    );
-    ok &= check_face(
-        [&](int i) { return make_pair(pos3d[i].y, pos3d[i].z); },
-        [&](int i) { return pos3d[i].x == dims.maxX; }
-    );
-    ok &= check_face(
-        [&](int i) { return make_pair(pos3d[i].x, pos3d[i].z); },
-        [&](int i) { return pos3d[i].y == dims.minY; }
-    );
-    ok &= check_face(
-        [&](int i) { return make_pair(pos3d[i].x, pos3d[i].z); },
-        [&](int i) { return pos3d[i].y == dims.maxY; }
-    );
-    ok &= check_face(
-        [&](int i) { return make_pair(pos3d[i].x, pos3d[i].y); },
-        [&](int i) { return pos3d[i].z == dims.minZ; }
-    );
-    ok &= check_face(
-        [&](int i) { return make_pair(pos3d[i].x, pos3d[i].y); },
-        [&](int i) { return pos3d[i].z == dims.maxZ; }
-    );
-    if (!ok) return false;
-
-    // Every cell must lie on one of the 6 faces
-    for (int i = 0; i < numCells; ++i) {
-        Vec3 p = pos3d[i];
-        bool onSurface =
-            (p.x == dims.minX || p.x == dims.maxX ||
-             p.y == dims.minY || p.y == dims.maxY ||
-             p.z == dims.minZ || p.z == dims.maxZ);
-        if (!onSurface) return false;
-    }
-
-    // Check total area matches 2*(ab+bc+ac)
-    int dx = dims.maxX - dims.minX + 1;
-    int dy = dims.maxY - dims.minY + 1;
-    int dz = dims.maxZ - dims.minZ + 1;
-    int expectedCells = 2 * (dx*dy + dx*dz + dy*dz);
-    if (expectedCells != numCells) return false;
-
-    return true;
-}
-
-bool check_markers(const vector<Marker> &markers,
-                   const vector<Cell> &cells,
-                   const vector<Vec3> &pos3d,
-                   const vector<Frame> &frame3d,
-                   const BoxDims &dims) {
-    int numCells = (int)cells.size();
-
-    // (r,c) -> cell index
-    unordered_map<long long,int> rcToIdx;
-    rcToIdx.reserve(numCells * 2);
-    for (int i = 0; i < numCells; ++i) {
-        long long key =
-            (static_cast<long long>(cells[i].r) << 32) |
-            static_cast<unsigned long long>(cells[i].c);
-        rcToIdx[key] = i;
-    }
-
-    vector<Marker> muse = markers;
-    for (auto &m : muse) {
-        long long key =
-            (static_cast<long long>(m.r) << 32) |
-            static_cast<unsigned long long>(m.c);
-        auto it = rcToIdx.find(key);
-        if (it == rcToIdx.end()) {
-            m.cellIndex = -1;
-        } else {
-            m.cellIndex = it->second;
-        }
-    }
-
-    // ---- Circle constraints ----
-    vector<int> circleIdx;
-    for (int i = 0; i < (int)muse.size(); ++i) {
-        if (muse[i].type == 'c' && muse[i].cellIndex != -1)
-            circleIdx.push_back(i);
-    }
-    vector<bool> used(circleIdx.size(), false);
-
-    auto same3 = [](const Vec3 &a, const Vec3 &b) {
-        return a.x == b.x && a.y == b.y && a.z == b.z;
-    };
-
-    for (int i = 0; i < (int)circleIdx.size(); ++i) {
-        if (used[i]) continue;
-        int mi = circleIdx[i];
-        int ci = muse[mi].cellIndex;
-        Vec3 p = pos3d[ci];
-        Vec3 n = frame3d[ci].n;
-
-        Vec3 target = p;
-        if (n.x != 0) {
-            target.x = (p.x == dims.minX) ? dims.maxX : dims.minX;
-        } else if (n.y != 0) {
-            target.y = (p.y == dims.minY) ? dims.maxY : dims.minY;
-        } else if (n.z != 0) {
-            target.z = (p.z == dims.minZ) ? dims.maxZ : dims.minZ;
-        } else {
-            return false;
-        }
-
-        bool found = false;
-        for (int j = i+1; j < (int)circleIdx.size(); ++j) {
-            if (used[j]) continue;
-            int mj = circleIdx[j];
-            int cj = muse[mj].cellIndex;
-            Vec3 pj = pos3d[cj];
-            if (same3(target, pj)) {
-                used[i] = used[j] = true;
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-
-    // ---- Square constraints ----
-    vector<int> squareCells;
-    for (auto &m : muse) {
-        if (m.type == 's' && m.cellIndex != -1)
-            squareCells.push_back(m.cellIndex);
-    }
-
-    auto is_on_same_face = [&](int a, int b) -> bool {
-        Vec3 pa = pos3d[a], pb = pos3d[b];
-        if (pa.x == pb.x && (pa.x == dims.minX || pa.x == dims.maxX)) return true;
-        if (pa.y == pb.y && (pa.y == dims.minY || pa.y == dims.maxY)) return true;
-        if (pa.z == pb.z && (pa.z == dims.minZ || pa.z == dims.maxZ)) return true;
-        return false;
-    };
-
-    for (int idx : squareCells) {
-        Vec3 p = pos3d[idx];
-        bool ok = false;
-        for (int jdx : squareCells) {
-            if (idx == jdx) continue;
-            if (!is_on_same_face(idx, jdx)) continue;
-            Vec3 q = pos3d[jdx];
-            int dx = abs(p.x - q.x);
-            int dy = abs(p.y - q.y);
-            int dz = abs(p.z - q.z);
-            if (dx + dy + dz == 1) {
-                ok = true;
-                break;
-            }
-        }
-        if (!ok) return false;
-    }
-
-    return true;
-}
-
-// ----------------- Helpers for DFS -----------------
-
-Vec3 step_from_frame(const Frame &f, Dir d) {
-    switch(d) {
-        case UP:    return {-f.v.x, -f.v.y, -f.v.z};
-        case DOWN:  return { f.v.x,  f.v.y,  f.v.z};
-        case LEFT:  return {-f.u.x, -f.u.y, -f.u.z};
-        case RIGHT: return { f.u.x,  f.u.y,  f.u.z};
-    }
-    return {0,0,0};
-}
-
-// Map a normal vector to an index 0..5 (for counting)
-int normal_id(const Vec3 &n) {
-    if (n.x ==  1 && n.y == 0 && n.z == 0) return 0; // +X
-    if (n.x == -1 && n.y == 0 && n.z == 0) return 1; // -X
-    if (n.x == 0 && n.y ==  1 && n.z == 0) return 2; // +Y
-    if (n.x == 0 && n.y == -1 && n.z == 0) return 3; // -Y
-    if (n.x == 0 && n.y == 0 && n.z ==  1) return 4; // +Z
-    if (n.x == 0 && n.y == 0 && n.z == -1) return 5; // -Z
-    return -1; // shouldn't happen if frames are orthonormal
-}
-
-struct RectangularPrism {
-    vector<Vec3> pos;
-    vector<Frame> frame;
-    vector<bool> assigned;
-    unordered_map<Vec3, int, Vec3Hash> occ;
-    array<int, 6> normalCount{};
-    int assignedCount = 0;
-    int maxFaceArea;
-    int numCells;
-
-    RectangularPrism(int n, int maxFace)
-        : pos(n), frame(n), assigned(n, false), maxFaceArea(maxFace), numCells(n) {}
-
-    void reset() {
-        fill(assigned.begin(), assigned.end(), false);
-        occ.clear();
-        assignedCount = 0;
-        normalCount.fill(0);
-    }
-
-    bool place_root(int idx, const Vec3 &p, const Frame &f) {
-        reset();
-        return place(idx, p, f);
-    }
-
-    bool place(int idx, const Vec3 &p, const Frame &f) {
-        if (idx < 0 || idx >= numCells) return false;
-        if (assigned[idx]) return false;
-        if (occ.find(p) != occ.end()) return false;
-
-        int nid = normal_id(f.n);
-        if (nid < 0) return false;
-        if (normalCount[nid] + 1 > maxFaceArea) return false;
-
-        pos[idx] = p;
-        frame[idx] = f;
-        assigned[idx] = true;
-        occ[p] = idx;
-        assignedCount++;
-        normalCount[nid]++;
-        return true;
-    }
-
-    void unplace(int idx) {
-        if (!assigned[idx]) return;
-        int nid = normal_id(frame[idx].n);
-        if (nid >= 0) normalCount[nid]--;
-        occ.erase(pos[idx]);
-        assigned[idx] = false;
-        assignedCount--;
-    }
-
-    bool finalize(BoxDims &dims) {
-        if (assignedCount != numCells) return false;
-        return compute_box_dims_and_check(pos, numCells, dims);
-    }
-};
-
-void print_partial_grid(const vector<Cell> &cells,
-                        const vector<Frame> &frame,
-                        const vector<bool> &assigned,
-                        int R, int C)
-{
-    vector<string> g(R, string(C, '.'));
-
-    for (int i = 0; i < (int)cells.size(); ++i) {
-        int r = cells[i].r;
-        int c = cells[i].c;
-
-        if (!assigned[i]) {
-            g[r][c] = '?';
-            continue;
-        }
-
-        Vec3 n = frame[i].n;
-        int f = 0;
-        if      (n.x ==  1 && n.y == 0 && n.z == 0) f = 1;
-        else if (n.x == -1 && n.y == 0 && n.z == 0) f = 2;
-        else if (n.x == 0 && n.y ==  1 && n.z == 0) f = 3;
-        else if (n.x == 0 && n.y == -1 && n.z == 0) f = 4;
-        else if (n.x == 0 && n.y == 0 && n.z ==  1) f = 5;
-        else if (n.x == 0 && n.y == 0 && n.z == -1) f = 6;
-        else g[r][c] = 'X'; // shouldn't happen if frames are orthonormal
-
-        if (f != 0)
-            g[r][c] = char('0' + f);
-    }
-
-    cerr << "\n--- PARTIAL EMBEDDING (by normals) ---\n";
-    for (int r = 0; r < R; ++r)
-        cerr << g[r] << "\n";
-    cerr << "--------------------------------------\n";
-}
-
-// ----------------- Core DFS solver (fast, for parallel search) -----------------
-
-bool solve_one_fast(const vector<string> &grid,
-                    const vector<Marker> &markers,
-                    int solIndex,
-                    mutex *ioMutex) {
-    int R = (int)grid.size();
-    int C = (int)grid[0].size();
-
-    // Build cells and index map
-    vector<Cell> cells;
-    vector<vector<int>> idx(R, vector<int>(C, -1));
-    for (int r = 0; r < R; ++r) {
-        for (int c = 0; c < C; ++c) {
-            if (grid[r][c] == '#') {
-                int id = (int)cells.size();
-                cells.push_back({r,c});
-                idx[r][c] = id;
-            }
-        }
-    }
-    int numCells = (int)cells.size();
-    if (numCells == 0) return false;
-    int maxFaceArea = max_face_area_from_surface(numCells);
-
-    // Build adjacency
-    vector<vector<Edge>> adj(numCells);
-    auto add_edge = [&](int r1, int c1, int r2, int c2, Dir d) {
-        int a = idx[r1][c1];
-        int b = idx[r2][c2];
-        if (a == -1 || b == -1) return;
-        adj[a].push_back({b, d});
-    };
-    for (int r = 0; r < R; ++r) {
-        for (int c = 0; c < C; ++c) {
-            if (idx[r][c] == -1) continue;
-            if (r > 0)   add_edge(r,c,r-1,c,UP);
-            if (r+1 < R) add_edge(r,c,r+1,c,DOWN);
-            if (c > 0)   add_edge(r,c,r,c-1,LEFT);
-            if (c+1 < C) add_edge(r,c,r,c+1,RIGHT);
-        }
-    }
-
-    // Build reverse adjacency: for each cell b, revAdj[b] lists incoming neighbors nb
-    vector<vector<Edge>> revAdj(numCells);
-    for (int i = 0; i < numCells; ++i) {
-        for (auto &e : adj[i]) {
-            revAdj[e.to].push_back({i, e.dir}); // i -> e.to with dir e.dir
-        }
-    }
-
-    // Embedding structures
-    RectangularPrism prism(numCells, maxFaceArea);
-
-    // Choose a root with the highest degree to reduce branching
-    int root = 0;
-    for (int i = 1; i < numCells; ++i) {
-        if ((int)adj[i].size() > (int)adj[root].size()) root = i;
-    }
-
-    prism.place_root(root, {0,0,0}, { {1,0,0}, {0,1,0}, {0,0,1} });
-
-    auto compute_candidate_from_neighbor =
-        [&](int a, Dir d, int mode, Vec3 &candPos, Frame &candFrame) {
-            const Frame &fa = prism.frame[a];
-            const Vec3 &pa = prism.pos[a];
-            Vec3 step = step_from_frame(fa, d);
-
-            // The hinge axis is the edge shared by the two cells. For moves
-            // along the grid's UP/DOWN, the edge runs along "u"; for LEFT/RIGHT
-            // it runs along "v". We must rotate both the frame and the offset
-            // vector around this axis to properly fold the neighbor out of the
-            // base plane.
-            Vec3 axis = (d == UP || d == DOWN) ? fa.u : fa.v;
-
-            if (mode == 0) {
-                // same face (no fold)
-                candPos = pa + step;
-                candFrame = fa;
-            } else {
-                Vec3 rotStep = (mode == 1) ? rotate90_plus(step, axis)
-                                           : rotate90_minus(step, axis);
-                candPos = pa + rotStep;
-
-                if (mode == 1) {
-                    candFrame.u = rotate90_plus(fa.u, axis);
-                    candFrame.v = rotate90_plus(fa.v, axis);
-                    candFrame.n = rotate90_plus(fa.n, axis);
-                } else {
-                    candFrame.u = rotate90_minus(fa.u, axis);
-                    candFrame.v = rotate90_minus(fa.v, axis);
-                    candFrame.n = rotate90_minus(fa.n, axis);
-                }
-            }
-        };
-
-    // Fast compatibility check using only assigned neighbors of b
-    auto candidate_compatible =
-        [&](int b, const Vec3 &candPos, const Frame &candFrame) -> bool {
-        for (auto &e : revAdj[b]) {
-            int nb = e.to;
-            if (!prism.assigned[nb]) continue;
-
-            Dir dnb = e.dir;
-
-            bool okNeighbor = false;
-            for (int mode = 0; mode < 3; ++mode) {
-                Vec3 p2; Frame f2;
-                compute_candidate_from_neighbor(nb, dnb, mode, p2, f2);
-                if (p2 == candPos && f2 == candFrame) {
-                    okNeighbor = true;
-                    break;
-                }
-            }
-            if (!okNeighbor) return false;
-        }
-        return true;
-    };
-
-    long long dfsIters = 0;
-    const long long PRINT_EVERY = 100000000; // every million dfs calls
-
-    std::function<bool()> dfs;
-    dfs = [&]() -> bool {
-        ++dfsIters;
-        if (dfsIters % PRINT_EVERY == 0) {
-            if (ioMutex) {
-                lock_guard<mutex> lock(*ioMutex);
-                cerr << "Sol #" << (solIndex + 1)
-                     << " DFS iters (fast): " << dfsIters << "\n";
-
-                print_partial_grid(cells, prism.frame, prism.assigned, R, C);
-            } else {
-                cerr << "Sol #" << (solIndex + 1)
-                     << " DFS iters (fast): " << dfsIters << "\n";
-                print_partial_grid(cells, prism.frame, prism.assigned, R, C);
-            }
-        }
-
-        if (prism.assignedCount == numCells) {
-            BoxDims dims;
-            if (!prism.finalize(dims)) return false;
-            if (!check_markers(markers, cells, prism.pos, prism.frame, dims))
-                return false;
-            return true; // success: box + markers satisfied
-        }
-
-        int b = -1, a = -1;
-        Dir dirFromAtoB = UP;
-        bool foundFrontier = false;
-
-        for (int i = 0; i < numCells && !foundFrontier; ++i) {
-            if (!prism.assigned[i]) continue;
-            for (auto &e : adj[i]) {
-                if (!prism.assigned[e.to]) {
-                    a = i;
-                    b = e.to;
-                    dirFromAtoB = e.dir;
-                    foundFrontier = true;
-                    break;
-                }
-            }
-        }
-        if (!foundFrontier) {
-            return false;
-        }
-
-        for (int mode = 0; mode < 3; ++mode) { // 0: same, 1: +90, 2: -90
-            Vec3 candPos;
-            Frame candFrame;
-            compute_candidate_from_neighbor(a, dirFromAtoB, mode, candPos, candFrame);
-
-            if (prism.occ.find(candPos) != prism.occ.end()) continue;
-            if (!candidate_compatible(b, candPos, candFrame)) continue;
-
-            if (prism.place(b, candPos, candFrame)) {
-                if (dfs()) return true;
-                prism.unplace(b);
-            }
-        }
-        return false;
-    };
-
-    bool ok = dfs();
-    if (ioMutex) {
-        lock_guard<mutex> lock(*ioMutex);
-        cerr << "Sol #" << (solIndex + 1)
-             << " DFS iters (fast): " << dfsIters << " (done)\n";
-    }
-    return ok;
-}
-
-// ----------------- DFS solver with capture + progress (sequential, for final solution) -----------------
-
-bool solve_one_capture(const vector<string> &grid,
-                       const vector<Marker> &markers,
-                       vector<Cell> &outCells,
-                       vector<Vec3> &outPos,
-                       BoxDims &outDims,
-                       long long &outIters) {
-    int R = (int)grid.size();
-    int C = (int)grid[0].size();
-
-    vector<Cell> cells;
-    vector<vector<int>> idx(R, vector<int>(C, -1));
-    for (int r = 0; r < R; ++r) {
-        for (int c = 0; c < C; ++c) {
-            if (grid[r][c] == '#') {
-                int id = (int)cells.size();
-                cells.push_back({r,c});
-                idx[r][c] = id;
-            }
-        }
-    }
-    int numCells = (int)cells.size();
-    if (numCells == 0) return false;
-    int maxFaceArea = max_face_area_from_surface(numCells);
-
-    vector<vector<Edge>> adj(numCells);
-    auto add_edge = [&](int r1, int c1, int r2, int c2, Dir d) {
-        int a = idx[r1][c1];
-        int b = idx[r2][c2];
-        if (a == -1 || b == -1) return;
-        adj[a].push_back({b, d});
-    };
-    for (int r = 0; r < R; ++r) {
-        for (int c = 0; c < C; ++c) {
-            if (idx[r][c] == -1) continue;
-            if (r > 0)   add_edge(r,c,r-1,c,UP);
-            if (r+1 < R) add_edge(r,c,r+1,c,DOWN);
-            if (c > 0)   add_edge(r,c,r,c-1,LEFT);
-            if (c+1 < C) add_edge(r,c,r,c+1,RIGHT);
-        }
-    }
-
-    // Reverse adjacency for capture solver as well
-    vector<vector<Edge>> revAdj(numCells);
-    for (int i = 0; i < numCells; ++i) {
-        for (auto &e : adj[i]) {
-            revAdj[e.to].push_back({i, e.dir});
-        }
-    }
-
-    RectangularPrism prism(numCells, maxFaceArea);
-
-    int root = 0;
-    for (int i = 1; i < numCells; ++i) {
-        if ((int)adj[i].size() > (int)adj[root].size()) root = i;
-    }
-
-    prism.place_root(root, {0,0,0}, { {1,0,0}, {0,1,0}, {0,0,1} });
-
-    auto compute_candidate_from_neighbor =
-        [&](int a, Dir d, int mode, Vec3 &candPos, Frame &candFrame) {
-            const Frame &fa = prism.frame[a];
-            const Vec3 &pa = prism.pos[a];
-            Vec3 step = step_from_frame(fa, d);
-
-            Vec3 axis = (d == UP || d == DOWN) ? fa.u : fa.v;
-
-            if (mode == 0) {
-                candPos = pa + step;
-                candFrame = fa;
-            } else {
-                Vec3 rotStep = (mode == 1) ? rotate90_plus(step, axis)
-                                           : rotate90_minus(step, axis);
-                candPos = pa + rotStep;
-
-                if (mode == 1) {
-                    candFrame.u = rotate90_plus(fa.u, axis);
-                    candFrame.v = rotate90_plus(fa.v, axis);
-                    candFrame.n = rotate90_plus(fa.n, axis);
-                } else {
-                    candFrame.u = rotate90_minus(fa.u, axis);
-                    candFrame.v = rotate90_minus(fa.v, axis);
-                    candFrame.n = rotate90_minus(fa.n, axis);
-                }
-            }
-        };
-
-    auto candidate_compatible =
-        [&](int b, const Vec3 &candPos, const Frame &candFrame) -> bool {
-        for (auto &e : revAdj[b]) {
-            int nb = e.to;
-            if (!prism.assigned[nb]) continue;
-
-            Dir dnb = e.dir;
-
-            bool okNeighbor = false;
-            for (int mode = 0; mode < 3; ++mode) {
-                Vec3 p2; Frame f2;
-                compute_candidate_from_neighbor(nb, dnb, mode, p2, f2);
-                if (p2 == candPos && f2 == candFrame) {
-                    okNeighbor = true;
-                    break;
-                }
-            }
-            if (!okNeighbor) return false;
-        }
-        return true;
-    };
-
-    long long dfsIters = 0;
-    const long long PRINT_EVERY = 100000; // print every 100k DFS calls
-
-    std::function<bool()> dfs;
-    dfs = [&]() -> bool {
-        ++dfsIters;
-        if (dfsIters % PRINT_EVERY == 0) {
-            cerr << "DFS iterations (capture): " << dfsIters << "\r";
-            cerr.flush();
-        }
-
-        if (prism.assignedCount == numCells) {
-            BoxDims dims;
-            if (!prism.finalize(dims)) return false;
-            if (!check_markers(markers, cells, prism.pos, prism.frame, dims))
-                return false;
-
-            outCells = cells;
-            outPos = prism.pos;
-            outDims = dims;
-            outIters = dfsIters;
-            return true;
-        }
-
-        int bestA = -1, bestB = -1;
-        Dir bestDir = UP;
-        int bestNeighborCount = -1;
-
-        for (int i = 0; i < numCells; ++i) {
-            if (!prism.assigned[i]) continue;
-            for (auto &e : adj[i]) {
-                int j = e.to;
-                if (prism.assigned[j]) continue;
-
-                int cnt = 0;
-                for (auto &e2 : adj[j]) {
-                    if (prism.assigned[e2.to]) ++cnt;
-                }
-                if (cnt > bestNeighborCount) {
-                    bestNeighborCount = cnt;
-                    bestA = i;
-                    bestB = j;
-                    bestDir = e.dir;
-                }
-            }
-        }
-
-        if (bestB == -1) {
-            return false;
-        }
-
-        int a = bestA;
-        int b = bestB;
-        Dir dirFromAtoB = bestDir;
-
-        for (int mode = 0; mode < 3; ++mode) {
-            Vec3 candPos;
-            Frame candFrame;
-            compute_candidate_from_neighbor(a, dirFromAtoB, mode, candPos, candFrame);
-
-            if (prism.occ.find(candPos) != prism.occ.end()) continue;
-            if (!candidate_compatible(b, candPos, candFrame)) continue;
-
-            if (prism.place(b, candPos, candFrame)) {
-                if (dfs()) return true;
-                prism.unplace(b);
-            }
-        }
-        return false;
-    };
-
-    bool ok = dfs();
-    cerr << "DFS iterations (capture): " << dfsIters << " (done)\n";
-    return ok;
-}
-
-// ----------------- Read solutions.txt -----------------
-
-vector<vector<string>> read_solutions(const string &filename) {
-    ifstream in(filename);
+vector<Net> loadNets(const string &path) {
+    ifstream in(path);
+    vector<Net> nets;
     if (!in) {
-        cerr << "Cannot open " << filename << "\n";
-        exit(1);
+        lock_guard<mutex> lock(g_cerrMutex);
+        cerr << "Failed to open " << path << " for reading.\n";
+        return nets;
     }
-    vector<vector<string>> sols;
+
+    Net current;
     string line;
     while (getline(in, line)) {
         if (line.rfind("Solution #", 0) == 0) {
-            vector<string> grid;
-            for (int i = 0; i < 20; ++i) {
-                string g;
-                if (!getline(in, g)) {
-                    cerr << "Unexpected EOF while reading grid\n";
-                    exit(1);
-                }
-                grid.push_back(g);
+            if (!current.rows.empty()) {
+                nets.push_back(current);
+                current = Net();
             }
-            sols.push_back(grid);
+            current.header = line;
+        } else if (line.empty()) {
+            if (!current.rows.empty()) {
+                nets.push_back(current);
+                current = Net();
+            }
+        } else {
+            current.rows.push_back(line);
         }
     }
-    return sols;
-}
-
-// ----------------- Face labeling helper -----------------
-
-int face_id(const Vec3 &p, const BoxDims &d) {
-    if (p.z == d.minZ) return 5; // bottom
-    if (p.z == d.maxZ) return 6; // top
-    if (p.y == d.minY) return 3; // front
-    if (p.y == d.maxY) return 4; // back
-    if (p.x == d.minX) return 1; // left
-    return 2;                    // right
-}
-
-// ----------------- Main (parallel search + sequential capture) -----------------
-
-int main(int argc, char **argv) {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
-
-    // Optional: run the 8x8 example provided in the prompt.
-    if (argc > 1 && string(argv[1]) == "--example8") {
-        vector<string> grid = {
-            "........",
-            "..##....",
-            "######..",
-            "..##.###",
-            "####....",
-            "...#....",
-            "..#####.",
-            "####.#.."
-        };
-
-        vector<Marker> markers = {
-            {1,3,5,'n',-1}, {2,0,2,'n',-1}, {2,1,5,'s',-1}, {2,5,4,'n',-1},
-            {3,7,2,'s',-1}, {3,0,2,'n',-1}, {5,3,5,'c',-1}, {6,3,6,'n',-1},
-            {6,4,6,'c',-1}, {7,1,4,'c',-1}, {7,5,4,'c',-1}
-        };
-
-        vector<Cell> cells;
-        vector<Vec3> pos;
-        BoxDims dims;
-        long long dfsIters = 0;
-
-        cerr << "Solving 8x8 example net...\n";
-        bool ok = solve_one_capture(grid, markers, cells, pos, dims, dfsIters);
-        if (!ok) {
-            cout << "No valid folding found for the 8x8 example.\n";
-            return 0;
-        }
-
-        cout << "Found valid folding for the 8x8 example!\n\n";
-        cout << "Face-labeled grid (1–6 for faces, . for empty):\n";
-        vector<string> faceGrid(grid.size(), string(grid[0].size(), '.'));
-        for (size_t i = 0; i < cells.size(); ++i) {
-            int r = cells[i].r;
-            int c = cells[i].c;
-            int f = face_id(pos[i], dims);
-            faceGrid[r][c] = char('0' + f);
-        }
-        for (auto &row : faceGrid) cout << row << "\n";
-        cout << "\nTotal DFS calls: " << dfsIters << "\n";
-        return 0;
+    if (!current.rows.empty()) {
+        nets.push_back(current);
     }
 
-    // Markers (0-based indices: row, col, value, type)
-    vector<Marker> markers = {
-        {1,11,4,'n',-1}, {1,15,4,'c',-1}, {2,7,5,'s',-1},
-        {3,12,7,'n',-1}, {3,14,5,'c',-1}, {4,10,4,'c',-1},
-        {4,13,7,'n',-1}, {4,17,4,'c',-1},
-        {5,6,4,'n',-1},  {5,8,7,'s',-1},  {6,7,9,'n',-1},
-        {7,17,6,'s',-1}, {8,2,7,'c',-1},  {8,11,5,'s',-1},
-        {9,14,5,'n',-1}, {10,5,4,'n',-1}, {10,7,7,'n',-1},
-        {10,18,3,'s',-1}, {13,3,5,'s',-1}, {13,6,6,'n',-1},
-        {13,9,2,'n',-1}, {15,6,5,'n',-1}, {17,12,5,'c',-1},
-        {17,13,5,'n',-1}, {18,8,4,'s',-1}
+    for (size_t idx = 0; idx < nets.size(); ++idx) {
+        Net &net = nets[idx];
+        net.index = static_cast<int>(idx);
+        int maxWidth = 0;
+        net.totalTiles = 0;
+        for (const auto &row : net.rows) {
+            maxWidth = max(maxWidth, static_cast<int>(row.size()));
+        }
+        for (auto &row : net.rows) {
+            if (static_cast<int>(row.size()) < maxWidth) {
+                row += string(maxWidth - row.size(), '.');
+            }
+            net.totalTiles += static_cast<int>(count(row.begin(), row.end(), '#'));
+        }
+    }
+    return nets;
+}
+
+// Apply the given global marker set (1-based coordinates) to all nets.
+void applyMarkersToNets(vector<Net> &nets) {
+    vector<tuple<int,int,char>> markerData = {
+        {1, 15, 'c'},
+        {2, 7,  's'},
+        {3, 14, 'c'},
+        {4, 10, 'c'},
+        {4, 17, 'c'},
+        {5, 8,  's'},
+        {7, 17, 's'},
+        {8, 2,  'c'},
+        {8, 11, 's'},
+        {10,18, 's'},
+        {13,3,  's'},
+        {17,12, 'c'},
+        {18,8,  's'}
     };
 
-    auto solutions = read_solutions("solutions.txt");
-    int nSol = (int)solutions.size();
+    for (auto &net : nets) {
+        net.markers.clear();
+        for (auto [r1, c1, t] : markerData) {
+            int r = r1 - 1;
+            int c = c1 - 1;
+            if (r < 0 || r >= (int)net.rows.size()) continue;
+            if (c < 0 || c >= (int)net.rows[r].size()) continue;
+            if (net.rows[r][c] != '#') continue;
+            Marker m;
+            m.row = r;
+            m.col = c;
+            m.type = t;
+            net.markers.push_back(m);
+        }
+    }
+}
 
-    if (nSol == 0) {
-        cout << "No grids in solutions.txt\n";
-        return 0;
+ProcessResult processNet(const Net &net) {
+    ProcessResult res;
+    res.header = net.header;
+    res.index = net.index;
+    res.totalTiles = net.totalTiles;
+    res.originalGrid = net.rows;
+
+    if (net.rows.empty()) {
+        res.failureReason = "No grid data";
+        return res;
+    }
+    if (net.totalTiles == 0) {
+        res.failureReason = "Grid contains no '#'";
+        return res;
+    }
+    if (net.totalTiles % 2 != 0) {
+        res.failureReason = "Odd number of tiles";
+        return res;
     }
 
-    atomic<int> nextIndex{0};
-    atomic<bool> found{false};
-    atomic<int> bestSol{-1};
-    atomic<int> solutionsChecked{0};
-    mutex ioMutex;
+    const int halfArea = net.totalTiles / 2;
+    vector<tuple<int,int,int>> triples = enumerateTriples(halfArea);
+    if (triples.empty()) {
+        res.failureReason = "No integer box dimensions for tile count";
+        return res;
+    }
 
-    int numThreads = 8; // bump this if you want more parallelism
-    cerr << "Starting parallel search on " << nSol
-         << " candidate grids using " << numThreads << " threads.\n";
+    FoldingSolver solver(net.rows, net.index);
 
-    vector<thread> threads;
-    threads.reserve(numThreads);
+    if (!net.markers.empty()) {
+        vector<tuple<int,int,char>> marks;
+        marks.reserve(net.markers.size());
+        for (const Marker &m : net.markers) {
+            marks.emplace_back(m.row, m.col, m.type);
+        }
+        solver.setMarkers(marks);
+    }
 
-    for (int t = 0; t < numThreads; ++t) {
-        threads.emplace_back([&]() {
-            while (!found.load(memory_order_relaxed)) {
-                int i = nextIndex.fetch_add(1, memory_order_relaxed);
-                if (i >= nSol) break;
+    if (solver.tileCount() != net.totalTiles) {
+        res.failureReason = "Internal tile count mismatch";
+        return res;
+    }
 
-                {
-                    lock_guard<mutex> lock(ioMutex);
-                    cerr << "Starting Solution #" << (i + 1) << "\n";
-                }
+    long long totalIterations = 0;
 
-                bool ok = solve_one_fast(solutions[i], markers, i, &ioMutex);
+    for (auto [a, b, c] : triples) {
+        if (g_stop.load(memory_order_relaxed)) break;
 
-                int done = solutionsChecked.fetch_add(1) + 1;
-                {
-                    lock_guard<mutex> lock(ioMutex);
-                    double frac = (double)done / (double)nSol;
-                    int barWidth = 40;
-                    int filled = (int)(frac * barWidth);
-                    cerr << "[";
-                    for (int j = 0; j < barWidth; ++j) {
-                        cerr << (j < filled ? '#' : ' ');
-                    }
-                    cerr << "] " << done << "/" << nSol << "\r";
-                    cerr.flush();
-                }
+        vector<int> assignment;
+        int rootPatch = -1;
 
-                if (ok) {
-                    bool expected = false;
-                    if (found.compare_exchange_strong(expected, true)) {
-                        bestSol.store(i, memory_order_relaxed);
-                    }
-                    break;
-                }
+        bool ok = solver.solveForDims(a, b, c, assignment, rootPatch);
+        totalIterations += solver.getIterationCount();
+
+        if (ok) {
+            res.valid = true;
+            res.Lx = a;
+            res.Ly = b;
+            res.Lz = c;
+            res.rootPatch = rootPatch;
+            res.labeledGrid = solver.buildLabeledGrid(assignment, a, b, c);
+            res.mappingLines = solver.describeAssignment(assignment, a, b, c);
+            res.dfsIterations = totalIterations;
+
+            {
+                lock_guard<mutex> lock(g_cerrMutex);
+                cerr << "\r[Net " << (net.index + 1) << "] "
+                     << "valid folding for " << a << "x" << b << "x" << c
+                     << " after " << totalIterations << " DFS calls\n";
             }
-        });
-    }
 
-    for (auto &th : threads) th.join();
-
-    {
-        lock_guard<mutex> lock(ioMutex);
-        cerr << "\nParallel search done.\n";
-    }
-
-    int idx = bestSol.load();
-    if (idx == -1) {
-        cout << "No candidate grid satisfied box + circle/square constraints.\n";
-        return 0;
-    }
-
-    // Sequential capture solve with DFS progress
-    vector<Cell> cells;
-    vector<Vec3> pos;
-    BoxDims dims;
-    long long dfsIters = 0;
-
-    cerr << "Re-solving Solution #" << (idx + 1)
-         << " with capture + DFS progress...\n";
-
-    bool ok = solve_one_capture(solutions[idx], markers, cells, pos, dims, dfsIters);
-    if (!ok) {
-        cout << "Internal error: capture solve failed for Solution #" << (idx + 1) << "\n";
-        return 0;
-    }
-
-    cout << "Found valid box net with markers: Solution #" << (idx + 1) << "\n\n";
-
-    cout << "Original grid:\n";
-    for (const auto &row : solutions[idx]) {
-        cout << row << "\n";
-    }
-    cout << "\n";
-
-    const int R = 20, C = 20;
-    vector<string> faceGrid(R, string(C, '.'));
-    for (size_t i = 0; i < cells.size(); ++i) {
-        int r = cells[i].r;
-        int c = cells[i].c;
-        int f = face_id(pos[i], dims);
-        faceGrid[r][c] = char('0' + f);
-    }
-
-    // --- face area sanity check ---
-    int faceCount[7] = {0}; // 1..6 used
-    for (size_t i = 0; i < cells.size(); ++i) {
-        int f = face_id(pos[i], dims);
-        if (f >= 1 && f <= 6) {
-            faceCount[f]++;
+            return res;
         }
     }
 
-    int dx = dims.maxX - dims.minX + 1;
-    int dy = dims.maxY - dims.minY + 1;
-    int dz = dims.maxZ - dims.minZ + 1;
+    res.failureReason = "No folding matched any candidate box dimensions";
+    res.dfsIterations = totalIterations;
 
-    int expected_x = dy * dz; // faces 1 & 2
-    int expected_y = dx * dz; // faces 3 & 4
-    int expected_z = dx * dy; // faces 5 & 6
-
-    int totalCells = (int)cells.size();
-    int totalFacesArea = 0;
-    for (int f = 1; f <= 6; ++f) totalFacesArea += faceCount[f];
-
-    cout << "Face areas (cell counts):\n";
-    cout << "  Face 1 (x=minX): " << faceCount[1] << "\n";
-    cout << "  Face 2 (x=maxX): " << faceCount[2] << "\n";
-    cout << "  Face 3 (y=minY): " << faceCount[3] << "\n";
-    cout << "  Face 4 (y=maxY): " << faceCount[4] << "\n";
-    cout << "  Face 5 (z=minZ): " << faceCount[5] << "\n";
-    cout << "  Face 6 (z=maxZ): " << faceCount[6] << "\n\n";
-
-    cout << "Box dims from embedding: dx=" << dx
-         << ", dy=" << dy << ", dz=" << dz << "\n";
-    cout << "Expected areas from box dims:\n";
-    cout << "  Faces 1 & 2 (dy*dz): " << expected_x << "\n";
-    cout << "  Faces 3 & 4 (dx*dz): " << expected_y << "\n";
-    cout << "  Faces 5 & 6 (dx*dy): " << expected_z << "\n\n";
-
-    cout << "Check:\n";
-    cout << "  face1 == face2? " << (faceCount[1] == faceCount[2] ? "OK" : "MISMATCH") << "\n";
-    cout << "  face3 == face4? " << (faceCount[3] == faceCount[4] ? "OK" : "MISMATCH") << "\n";
-    cout << "  face5 == face6? " << (faceCount[5] == faceCount[6] ? "OK" : "MISMATCH") << "\n";
-
-    cout << "  face1/2 area match dy*dz? "
-         << ((faceCount[1] == expected_x && faceCount[2] == expected_x) ? "OK" : "MISMATCH") << "\n";
-    cout << "  face3/4 area match dx*dz? "
-         << ((faceCount[3] == expected_y && faceCount[4] == expected_y) ? "OK" : "MISMATCH") << "\n";
-    cout << "  face5/6 area match dx*dy? "
-         << ((faceCount[5] == expected_z && faceCount[6] == expected_z) ? "OK" : "MISMATCH") << "\n";
-
-    cout << "  total face area = " << totalFacesArea
-         << ", total cells = " << totalCells
-         << (totalFacesArea == totalCells ? " (OK)\n" : " (MISMATCH)\n");
-    cout << "\n";
-
-    cout << "Face-labeled grid (1–6 for faces, . for empty):\n";
-    for (int r = 0; r < R; ++r) {
-        cout << faceGrid[r] << "\n";
+    {
+        lock_guard<mutex> lock(g_cerrMutex);
+        cerr << "\r[Net " << (net.index + 1) << "] "
+             << "no valid folding after " << totalIterations
+             << " DFS calls\n";
     }
-    cout << "\n";
 
-    cout << "Total DFS calls for this embedding: " << dfsIters << "\n";
+    return res;
+}
+
+void writeWinnerResult(const vector<ProcessResult> &results,
+                       const string &path,
+                       int winnerIdx) {
+    ofstream out(path);
+    if (!out) {
+        lock_guard<mutex> lock(g_cerrMutex);
+        cerr << "Failed to open " << path << " for writing.\n";
+        return;
+    }
+
+    const string legend = "1=-X  2=+X  3=-Y  4=+Y  5=-Z  6=+Z";
+
+    if (winnerIdx < 0 || winnerIdx >= (int)results.size() ||
+        !results[winnerIdx].valid) {
+        out << "No valid embedding found.\n";
+        return;
+    }
+
+    const auto &res = results[winnerIdx];
+
+    out << res.header << "\n";
+    out << "Dimensions: " << res.Lx
+        << " x " << res.Ly
+        << " x " << res.Lz << "\n";
+    out << "Root patch index: " << res.rootPatch << "\n";
+    out << legend << "\n";
+    out << "DFS iterations: " << res.dfsIterations << "\n\n";
+
+    out << "Labeled grid:\n";
+    for (const auto &row : res.labeledGrid) out << row << "\n";
+
+    out << "\nOriginal grid:\n";
+    for (const auto &row : res.originalGrid) out << row << "\n";
+
+    out << "\nTile mapping:\n";
+    for (const auto &line : res.mappingLines) out << line << "\n";
+
+    out << "\n====\n";
+}
+
+} // namespace
+
+int main() {
+    const string inputPath = "solutions.txt";
+    const string outputPath = "solutionFINAL.txt";
+
+    vector<Net> nets = loadNets(inputPath);
+    if (nets.empty()) {
+        lock_guard<mutex> lock(g_cerrMutex);
+        cerr << "No nets available to process.\n";
+        return 1;
+    }
+
+    applyMarkersToNets(nets);
+
+    for (int i = 0; i < static_cast<int>(nets.size()); ++i) {
+        nets[i].index = i;
+    }
+
+    vector<ProcessResult> results(nets.size());
+    atomic<int> nextIndex{0};
+    const int totalNets = static_cast<int>(nets.size());
+    const int threadCount = min(8, totalNets);
+    vector<thread> workers;
+    workers.reserve(threadCount);
+
+    auto worker = [&]() {
+        while (true) {
+            if (g_stop.load(memory_order_relaxed)) break;
+            int idx = nextIndex.fetch_add(1);
+            if (idx >= totalNets) break;
+
+            const Net &net = nets[idx];
+            {
+                lock_guard<mutex> lock(g_cerrMutex);
+                cerr << "\n[Net " << (net.index + 1) << "/" << totalNets << "] "
+                     << net.header << "\n";
+            }
+
+            ProcessResult res = processNet(net);
+            results[idx] = res;
+
+            if (res.valid) {
+                int expected = -1;
+                if (g_winnerIndex.compare_exchange_strong(expected, idx)) {
+                    g_stop.store(true, memory_order_relaxed);
+                }
+            }
+        }
+    };
+
+    for (int i = 0; i < threadCount; ++i) {
+        workers.emplace_back(worker);
+    }
+    for (auto &t : workers) t.join();
+
+    int winnerIdx = g_winnerIndex.load();
+    writeWinnerResult(results, outputPath, winnerIdx);
+
+    {
+        lock_guard<mutex> lock(g_cerrMutex);
+        if (winnerIdx >= 0) {
+            cerr << "\nFirst valid embedding found in net index "
+                 << winnerIdx << " (1-based: " << (winnerIdx + 1) << ")\n";
+        } else {
+            cerr << "\nNo valid embedding found in any net.\n";
+        }
+        cerr << "Solution written to " << outputPath << "\n";
+    }
 
     return 0;
 }
